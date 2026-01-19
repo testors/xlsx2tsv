@@ -68,6 +68,17 @@ void filter_close(Filter* filter) {
     free(filter);
 }
 
+// Remove * characters from string
+void remove_wildcards(const char* input, char* output, int max_len) {
+    int j = 0;
+    for (int i = 0; input[i] && j < max_len - 1; i++) {
+        if (input[i] != '*') {
+            output[j++] = input[i];
+        }
+    }
+    output[j] = '\0';
+}
+
 void filter_push(Filter* filter, const char* data) {
     if (!filter || !data) {
         return;
@@ -91,7 +102,16 @@ void filter_push(Filter* filter, const char* data) {
         if (filter->valid_col_count > 0) {
             fputc('\t', filter->fp);
         }
-        fputs(data, filter->fp);
+
+        // Remove * characters only from header row (first row)
+        if (filter->row_count == 0) {
+            char cleaned_data[MAX_COLUMNS * 10];  // Sufficient buffer size
+            remove_wildcards(data, cleaned_data, sizeof(cleaned_data));
+            fputs(cleaned_data, filter->fp);
+        } else {
+            fputs(data, filter->fp);
+        }
+
         filter->valid_col_count++;
     }
 

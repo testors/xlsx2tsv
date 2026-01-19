@@ -228,10 +228,11 @@ void parse_workbook(const char* xml_data, Workbook* wb) {
         wb->sheets[wb->sheet_count].name[MAX_SHEET_NAME - 1] = '\0';
         wb->sheets[wb->sheet_count].sheet_id = sheet_id;
         
-        // Generate worksheet filename
-        snprintf(wb->sheets[wb->sheet_count].filename, MAX_SHEET_NAME, 
-                "xl/worksheets/sheet%d.xml", sheet_id);
-        
+        // Generate worksheet filename using sequential order (not sheetId)
+        // Excel file structure uses sheet1.xml, sheet2.xml, etc. in document order
+        snprintf(wb->sheets[wb->sheet_count].filename, MAX_SHEET_NAME,
+                "xl/worksheets/sheet%d.xml", wb->sheet_count + 1);
+
         wb->sheet_count++;
         
         free(name_attr);
@@ -299,7 +300,6 @@ void parse_worksheet(const char* xml_data, SharedStrings* ss, int start_row, Fil
     const char* pos = xml_data;
     int last_row = -1;
     int last_col = -1;
-    static int debug_count = 0;
     
     while ((pos = strstr(pos, "<c ")) != NULL) {
         // Find the end of this cell tag to limit our search scope
@@ -342,9 +342,7 @@ void parse_worksheet(const char* xml_data, SharedStrings* ss, int start_row, Fil
         
                 int row = extract_row_num(r_attr);
         int col = col_ref_to_num(r_attr);
-        
-        debug_count++;
-        
+
         // Skip rows before start_row
         if (row < start_row) {
             free(cell_content);
@@ -488,11 +486,17 @@ int main(int argc, char* argv[]) {
     if (argc < 2) {
         printf("Usage: %s <input.xlsx> [start_row] [--no-wildcard]\n", argv[0]);
         printf("  start_row: 1-based row number to start conversion (default: 1)\n");
-        printf("  Note: Output files will be named as '<SheetName>.tsv'\n");
-        printf("        Only sheets with names containing A-Z, a-z, 0-9, -, _, * will be processed\n");
-        printf("        Sheets with spaces, special characters, or non-ASCII will be skipped\n");
-        printf("        * characters in sheet names will be removed from output filenames\n");
-        printf("        --no-wildcard: Do not allow * characters in sheet names\n");
+        printf("\n");
+        printf("Wildcard (*) character behavior:\n");
+        printf("  Default mode:\n");
+        printf("    - * characters are removed from sheet/column names in output\n");
+        printf("    - Example: '*Sales' -> 'Sales.tsv', '*ID' column -> 'ID'\n");
+        printf("  --no-wildcard mode:\n");
+        printf("    - Sheets containing * will be skipped entirely\n");
+        printf("    - Columns containing * will be excluded from output\n");
+        printf("\n");
+        printf("Note: Only A-Z, a-z, 0-9, -, _, * characters are valid in sheet/column names\n");
+        printf("      Names with spaces, special characters, or non-ASCII will be skipped\n");
         return 1;
     }
     

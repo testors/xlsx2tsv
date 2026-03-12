@@ -1,6 +1,5 @@
 CC = gcc
-#CFLAGS = -O3 -Wall -Wextra -march=native -flto
-CFLAGS = -Wall -Wextra -march=native -flto -g
+CFLAGS = -O3 -DNDEBUG -Wall -Wextra -march=native -flto
 LDFLAGS = -lz
 TARGET = xlsx_to_tsv
 SOURCES = xlsx_to_tsv.c filter.c

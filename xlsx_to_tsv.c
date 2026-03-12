@@ -168,6 +168,61 @@ static inline int find_attribute(const char* xml, const char* attr_name, int att
     return len;
 }
 
+static const char* find_in_range(const char* start, const char* end,
+                                 const char* needle, size_t needle_len) {
+    const char* pos = start;
+
+    if (!start || !end || start >= end || needle_len == 0) {
+        return NULL;
+    }
+
+    while (pos < end) {
+        size_t remaining = (size_t)(end - pos);
+        const char* match;
+
+        if (remaining < needle_len) {
+            return NULL;
+        }
+
+        match = memchr(pos, needle[0], remaining - needle_len + 1);
+        if (!match) {
+            return NULL;
+        }
+
+        if (memcmp(match, needle, needle_len) == 0) {
+            return match;
+        }
+
+        pos = match + 1;
+    }
+
+    return NULL;
+}
+
+static inline int find_attribute_in_range(const char* start, const char* end,
+                                          const char* attr_name, int attr_len,
+                                          char* out_buffer, int max_len) {
+    const char* pos = find_in_range(start, end, attr_name, (size_t)attr_len);
+    if (!pos) return -1;
+
+    pos += attr_len;
+
+    while (pos < end && (*pos == ' ' || *pos == '\t')) pos++;
+
+    if (pos >= end || *pos != '"') return -1;
+    pos++;
+
+    const char* attr_end = memchr(pos, '"', (size_t)(end - pos));
+    if (!attr_end) return -1;
+
+    int len = (int)(attr_end - pos);
+    if (len >= max_len) len = max_len - 1;
+
+    memcpy(out_buffer, pos, (size_t)len);
+    out_buffer[len] = '\0';
+    return len;
+}
+
 // 일반적인 속성을 위한 헬퍼 매크로
 #define FIND_ATTR_NAME(xml, buf, sz) find_attribute(xml, "name=", 5, buf, sz)
 #define FIND_ATTR_SHEET_ID(xml, buf, sz) find_attribute(xml, "sheetId=", 8, buf, sz)
@@ -1151,6 +1206,15 @@ void init_shared_strings(SharedStrings* ss) {
     ss->count = 0;
 }
 
+static void reserve_shared_strings(SharedStrings* ss, int needed) {
+    if (needed <= ss->capacity) {
+        return;
+    }
+
+    ss->capacity = needed;
+    ss->strings = realloc(ss->strings, sizeof(char*) * ss->capacity);
+}
+
 // XML 엔티티를 제자리에서 언이스케이프 - 최적화 버전
 void unescape_xml_entities(char* str) {
     char* src = str;
@@ -1216,7 +1280,9 @@ void add_shared_string(SharedStrings* ss, const char* str) {
     ss->strings[ss->count] = strdup(str);
 
     // XML 엔티티 언이스케이프
-    unescape_xml_entities(ss->strings[ss->count]);
+    if (strchr(ss->strings[ss->count], '&')) {
+        unescape_xml_entities(ss->strings[ss->count]);
+    }
 
     ss->count++;
 
@@ -1229,6 +1295,21 @@ void add_shared_string(SharedStrings* ss, const char* str) {
 // 텍스트 내용을 추출하고 모든 태그를 건너뛰며 공유 문자열 XML 파싱
 void parse_shared_strings(const char* xml_data, SharedStrings* ss) {
     const char* pos = xml_data;
+    const char* sst_start = strstr(xml_data, "<sst");
+    char count_attr[32];
+
+    if (sst_start) {
+        const char* sst_end = strchr(sst_start, '>');
+        if (sst_end) {
+            if (find_attribute_in_range(sst_start, sst_end + 1, "uniqueCount=", 12,
+                                        count_attr, sizeof(count_attr)) >= 0) {
+                reserve_shared_strings(ss, atoi(count_attr));
+            } else if (find_attribute_in_range(sst_start, sst_end + 1, "count=", 6,
+                                               count_attr, sizeof(count_attr)) >= 0) {
+                reserve_shared_strings(ss, atoi(count_attr));
+            }
+        }
+    }
 
     // 각 <si> (공유 문자열 항목) 요소 찾기
     while ((pos = strstr(pos, "<si")) != NULL) {
@@ -1415,6 +1496,40 @@ static inline int col_ref_to_num(const char* ref) {
 static inline int extract_row_num(const char* ref) {
     while (*ref && isalpha(*ref)) ref++;
     return atoi(ref) - 1;
+}
+
+static inline bool parse_cell_ref_parts(const char* ref, int* row, int* col) {
+    int parsed_col = 0;
+    int parsed_row = 0;
+    const unsigned char* pos = (const unsigned char*)ref;
+
+    if (!pos || !isalpha(*pos)) {
+        return false;
+    }
+
+    while (*pos && isalpha(*pos)) {
+        unsigned char c = *pos++;
+        if (c >= 'a' && c <= 'z') {
+            c -= 'a' - 'A';
+        }
+        parsed_col = parsed_col * 26 + (c - 'A' + 1);
+    }
+
+    if (!isdigit(*pos)) {
+        return false;
+    }
+
+    while (*pos && isdigit(*pos)) {
+        parsed_row = parsed_row * 10 + (*pos++ - '0');
+    }
+
+    if (parsed_col <= 0 || parsed_row <= 0) {
+        return false;
+    }
+
+    *col = parsed_col - 1;
+    *row = parsed_row - 1;
+    return true;
 }
 
 static void parse_hidden_columns_xml(const char* xml_data, HiddenColumns* hidden_columns) {
@@ -1712,6 +1827,37 @@ void escape_tsv_value(const char* input, char* output, int max_len) {
     output[j] = '\0';
 }
 
+static inline void escape_tsv_value_range(const char* start, const char* end,
+                                          char* output, int max_len) {
+    int j = 0;
+
+    while (start < end && j < max_len - 1) {
+        if (*start == '\t' || *start == '\n' || *start == '\r') {
+            output[j++] = ' ';
+        } else {
+            output[j++] = *start;
+        }
+        start++;
+    }
+
+    output[j] = '\0';
+}
+
+static inline int parse_int_range(const char* start, const char* end) {
+    int value = 0;
+
+    while (start < end && isspace((unsigned char)*start)) {
+        start++;
+    }
+
+    while (start < end && isdigit((unsigned char)*start)) {
+        value = value * 10 + (*start - '0');
+        start++;
+    }
+
+    return value;
+}
+
 // 시트 이름에서 안전한 파일명용 베이스 이름 생성
 void create_safe_filename_base(const char* sheet_name, char* safe_name, int max_len) {
     int i = 0, j = 0;
@@ -1793,61 +1939,51 @@ void parse_worksheet(const char* xml_data, SharedStrings* ss, int start_row, Fil
     int last_row = -1;
     int last_col = -1;
 
-    // 반복 할당을 피하기 위한 재사용 가능한 버퍼
-    char cell_buffer[MAX_CELL_VALUE * 2];
     char r_attr[32];
     char t_attr[32];
+    char cell_value[MAX_CELL_VALUE];
 
     while ((pos = strstr(pos, "<c ")) != NULL) {
-        // 검색 범위를 제한하기 위해 이 셀 태그의 끝 찾기
-        const char* cell_end = NULL;
-        size_t cell_length = 0;
-
-        // 자기 닫힘 태그인지 확인
         const char* tag_close = strchr(pos, '>');
+        const char* cell_content_end;
+        const char* cell_end;
+        bool self_closing;
+        int row;
+        int col;
+        int has_t_attr;
         if (!tag_close) {
             pos++;
             continue;
         }
 
-        if (*(tag_close - 1) == '/') {
-            // 자기 닫힘 태그: <c ... />
+        self_closing = *(tag_close - 1) == '/';
+        if (self_closing) {
             cell_end = tag_close + 1;
-            cell_length = cell_end - pos;
+            cell_content_end = tag_close;
         } else {
-            // 일반 태그: <c ...>...</c>
-            cell_end = strstr(pos, "</c>");
-            if (!cell_end) {
+            cell_content_end = strstr(tag_close + 1, "</c>");
+            if (!cell_content_end) {
                 pos++;
                 continue;
             }
-            cell_length = cell_end - pos;
-            cell_end += 4; // </c>를 지나서 이동
+            cell_end = cell_content_end + 4;
         }
 
-        // 버퍼에 셀 내용 복사 (이 셀 내에서만 검색)
-        if (cell_length >= sizeof(cell_buffer)) {
-            cell_length = sizeof(cell_buffer) - 1;
-        }
-        memcpy(cell_buffer, pos, cell_length);
-        cell_buffer[cell_length] = '\0';
-
-        // 셀 참조 추출
-        if (FIND_ATTR_R(cell_buffer, r_attr, sizeof(r_attr)) < 0) {
+        if (find_attribute_in_range(pos, tag_close + 1, "r=", 2, r_attr, sizeof(r_attr)) < 0) {
             pos = cell_end;
             continue;
         }
 
-                int row = extract_row_num(r_attr);
-        int col = col_ref_to_num(r_attr);
+        if (!parse_cell_ref_parts(r_attr, &row, &col)) {
+            pos = cell_end;
+            continue;
+        }
 
-        // start_row 이전의 행 건너뛰기
         if (row < start_row) {
             pos = cell_end;
             continue;
         }
 
-        // 새로운 행으로 이동한 경우, 개행을 출력하고 열 추적 재설정
         if (last_row != -1 && row != last_row) {
             filter_finish_line(output);
 #ifdef DEBUG
@@ -1863,87 +1999,61 @@ void parse_worksheet(const char* xml_data, SharedStrings* ss, int start_row, Fil
             filter_push(output, "");
         }
 
-        // 동일한 셀 내용에서 셀 타입 추출
-        int has_t_attr = FIND_ATTR_T(cell_buffer, t_attr, sizeof(t_attr)) >= 0;
+        has_t_attr = find_attribute_in_range(pos, tag_close + 1, "t=", 2, t_attr, sizeof(t_attr)) >= 0;
+        cell_value[0] = '\0';
 
-        char cell_value[MAX_CELL_VALUE] = "";
-        char v_content[MAX_CELL_VALUE];
-        int has_v_content = 0;
+        if (!self_closing) {
+            const char* value_start = find_in_range(tag_close + 1, cell_content_end, "<v>", 3);
 
-        // 셀 값 찾기 - 다양한 셀 값 형식 처리 (cell_buffer 내에서만 검색)
-        // 방법 1: <v> 태그 찾기 (숫자 값 및 공유 문자열 참조용)
-        const char* v_start = strstr(cell_buffer, "<v>");
-        if (v_start && v_start < cell_buffer + cell_length) {
-            v_start += 3; // <v> 건너뛰기
-            const char* v_end = strstr(v_start, "</v>");
-            if (v_end && v_end < cell_buffer + cell_length) {
-                int len = v_end - v_start;
-                if (len >= MAX_CELL_VALUE) len = MAX_CELL_VALUE - 1;
-                memcpy(v_content, v_start, len);
-                v_content[len] = '\0';
-                has_v_content = 1;
+            if (value_start) {
+                const char* value_end;
+                value_start += 3;
+                value_end = find_in_range(value_start, cell_content_end, "</v>", 4);
+                if (value_end) {
+                    if (has_t_attr && strcmp(t_attr, "s") == 0) {
+                        int str_index = parse_int_range(value_start, value_end);
+                        if (str_index >= 0 && str_index < ss->count) {
+                            escape_tsv_value(ss->strings[str_index], cell_value, MAX_CELL_VALUE);
+                        }
+#ifdef DEBUG
+                        printf("DEBUG: Cell %s [+%dtabs] : shared_string[%d] : '%s'\n",
+                               r_attr, tabs_needed, str_index, cell_value);
+#endif
+                    } else {
+                        escape_tsv_value_range(value_start, value_end, cell_value, MAX_CELL_VALUE);
+#ifdef DEBUG
+                        printf("DEBUG: Cell %s [+%dtabs] : direct_value : '%s'\n",
+                               r_attr, tabs_needed, cell_value);
+#endif
+                    }
+                }
             }
-        }
 
-        // 방법 2: 인라인 문자열 <is><t> 태그 찾기 (인라인 텍스트용)
-        if (!has_v_content) {
-            const char* is_start = strstr(cell_buffer, "<is><t>");
-            if (is_start && is_start < cell_buffer + cell_length) {
-                is_start += 7; // <is><t> 건너뛰기
-                const char* is_end = strstr(is_start, "</t></is>");
-                if (is_end && is_end < cell_buffer + cell_length) {
-                    int len = is_end - is_start;
-                    if (len >= MAX_CELL_VALUE) len = MAX_CELL_VALUE - 1;
-                    memcpy(v_content, is_start, len);
-                    v_content[len] = '\0';
-                    has_v_content = 1;
+            if (!cell_value[0]) {
+                const char* inline_start = find_in_range(tag_close + 1, cell_content_end, "<is><t>", 7);
+                if (inline_start) {
+                    const char* inline_end;
+                    inline_start += 7;
+                    inline_end = find_in_range(inline_start, cell_content_end, "</t></is>", 9);
+                    if (inline_end) {
+                        escape_tsv_value_range(inline_start, inline_end, cell_value, MAX_CELL_VALUE);
+                    }
+                }
+            }
+
+            if (!cell_value[0]) {
+                const char* text_start = find_in_range(tag_close + 1, cell_content_end, "<t>", 3);
+                if (text_start) {
+                    const char* text_end;
+                    text_start += 3;
+                    text_end = find_in_range(text_start, cell_content_end, "</t>", 4);
+                    if (text_end) {
+                        escape_tsv_value_range(text_start, text_end, cell_value, MAX_CELL_VALUE);
+                    }
                 }
             }
         }
 
-        // 방법 3: 단순 <t> 태그 찾기 (일부 텍스트 값용)
-        if (!has_v_content) {
-            const char* t_start = strstr(cell_buffer, "<t>");
-            if (t_start && t_start < cell_buffer + cell_length) {
-                t_start += 3; // <t> 건너뛰기
-                const char* t_end = strstr(t_start, "</t>");
-                if (t_end && t_end < cell_buffer + cell_length) {
-                    int len = t_end - t_start;
-                    if (len >= MAX_CELL_VALUE) len = MAX_CELL_VALUE - 1;
-                    memcpy(v_content, t_start, len);
-                    v_content[len] = '\0';
-                    has_v_content = 1;
-                }
-            }
-        }
-
-        if (has_v_content) {
-            // 다양한 셀 타입 처리
-            if (has_t_attr && strcmp(t_attr, "s") == 0) {
-                // 공유 문자열 참조
-                int str_index = atoi(v_content);
-                if (str_index >= 0 && str_index < ss->count) {
-                    escape_tsv_value(ss->strings[str_index], cell_value, MAX_CELL_VALUE);
-#ifdef DEBUG
-                    printf("DEBUG: Cell %s [+%dtabs] '%s' : shared_string[%d] : '%s'\n",
-                           r_attr, tabs_needed, v_content, str_index, cell_value);
-#endif
-                }
-            } else {
-                // 숫자, 인라인 문자열 또는 기타 값
-                escape_tsv_value(v_content, cell_value, MAX_CELL_VALUE);
-#ifdef DEBUG
-                printf("DEBUG: Cell %s [+%dtabs] '%s' : direct_value : '%s'\n",
-                       r_attr, tabs_needed, v_content, cell_value);
-#endif
-            }
-        } else {
-#ifdef DEBUG
-            printf("DEBUG: Cell %s [+%dtabs] : empty_cell : ''\n", r_attr, tabs_needed);
-#endif
-        }
-
-        // 셀 값 출력
         filter_push(output, cell_value);
 
         last_row = row;

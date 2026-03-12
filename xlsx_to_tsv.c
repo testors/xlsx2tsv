@@ -9,110 +9,1170 @@
 #include "miniz.h"
 #include "filter.h"
 
-// *** xlsx_to_tsv
-
 #define MAX_CELL_VALUE 32768
 #define BUFFER_SIZE 65536
 #define MAX_SHEET_NAME 256
 #define MAX_SHEETS 50
+#define MAX_REL_ID 64
+#define MAX_OUTPUT_FILENAME (MAX_SHEET_NAME + 32)
 
-// Shared strings structure for performance
+// 성능을 위한 공유 문자열 구조체
 typedef struct {
     char** strings;
     int count;
     int capacity;
 } SharedStrings;
 
-// Sheet information structure
+// 시트 정보 구조체
 typedef struct {
     char name[MAX_SHEET_NAME];
+    char rel_id[MAX_REL_ID];
     char filename[MAX_SHEET_NAME];
+    char output_name[MAX_OUTPUT_FILENAME];
     int sheet_id;
 } SheetInfo;
 
-// Workbook structure
+// 워크북 구조체
 typedef struct {
     SheetInfo sheets[MAX_SHEETS];
     int sheet_count;
 } Workbook;
 
-// Fast XML attribute finder
-char* find_attribute(const char* xml, const char* attr_name) {
-    char* pos = strstr(xml, attr_name);
-    if (!pos) return NULL;
-    
-    pos += strlen(attr_name);
-    
-    // Skip whitespace
+typedef enum {
+    FORMAT_KIND_RAW,
+    FORMAT_KIND_NUMBER,
+    FORMAT_KIND_PERCENT,
+    FORMAT_KIND_SCIENTIFIC,
+    FORMAT_KIND_ZERO_PAD,
+    FORMAT_KIND_DATE,
+    FORMAT_KIND_TIME,
+    FORMAT_KIND_DATETIME,
+    FORMAT_KIND_DURATION
+} FormatKind;
+
+typedef struct {
+    FormatKind kind;
+    int decimals;
+    int zero_width;
+    bool use_thousands;
+    bool show_seconds;
+} CellFormat;
+
+typedef struct {
+    int num_fmt_id;
+    char* format_code;
+} CustomNumFormat;
+
+typedef struct {
+    CustomNumFormat* custom_formats;
+    int custom_count;
+    int custom_capacity;
+
+    CellFormat* xf_formats;
+    int xf_count;
+    int xf_capacity;
+
+    bool date_1904;
+    bool enabled;
+} Styles;
+
+typedef struct {
+    int start_col;
+    int end_col;
+} HiddenColumnRange;
+
+typedef struct {
+    HiddenColumnRange* ranges;
+    int count;
+    int capacity;
+} HiddenColumns;
+
+typedef struct {
+    int start_row;
+    int end_row;
+    int start_col;
+    int end_col;
+    char value[MAX_CELL_VALUE];
+    bool value_set;
+} MergeRegion;
+
+typedef struct {
+    MergeRegion* regions;
+    int count;
+    int capacity;
+} MergeRegions;
+
+typedef struct {
+    int col;
+    char* value;
+} RowCell;
+
+typedef struct {
+    RowCell* cells;
+    int count;
+    int capacity;
+} RowBuffer;
+
+void unescape_xml_entities(char* str);
+void escape_tsv_value(const char* input, char* output, int max_len);
+
+// 빠른 XML 속성 찾기 - 제공된 버퍼에 쓰기
+// 추출된 값의 길이를 반환, 찾지 못하면 -1 반환
+static inline int find_attribute(const char* xml, const char* attr_name, int attr_len, char* out_buffer, int max_len) {
+    const char* pos = strstr(xml, attr_name);
+    if (!pos) return -1;
+
+    pos += attr_len;
+
+    // 공백 건너뛰기
     while (*pos && (*pos == ' ' || *pos == '\t')) pos++;
-    
-    // Find opening quote
-    if (*pos != '"') return NULL;
-    pos++; // Skip opening quote
-    
-    // Find closing quote
-    char* end = strchr(pos, '"');
-    if (!end) return NULL;
-    
+
+    // 여는 따옴표 찾기
+    if (*pos != '"') return -1;
+    pos++; // 여는 따옴표 건너뛰기
+
+    // 닫는 따옴표 찾기
+    const char* end = strchr(pos, '"');
+    if (!end) return -1;
+
     int len = end - pos;
-    char* result = malloc(len + 1);
-    strncpy(result, pos, len);
-    result[len] = '\0';
-    return result;
+    if (len >= max_len) len = max_len - 1;
+
+    memcpy(out_buffer, pos, len);
+    out_buffer[len] = '\0';
+    return len;
 }
 
-// Fast XML content extractor
-char* extract_xml_content(const char* xml, const char* tag) {
-    char start_tag[256];
-    char end_tag[256];
-    snprintf(start_tag, sizeof(start_tag), "<%s>", tag);
-    snprintf(end_tag, sizeof(end_tag), "</%s>", tag);
-    
-    char* start = strstr(xml, start_tag);
-    if (!start) return NULL;
-    start += strlen(start_tag);
-    
-    char* end = strstr(start, end_tag);
-    if (!end) return NULL;
-    
-    int len = end - start;
-    char* result = malloc(len + 1);
-    strncpy(result, start, len);
-    result[len] = '\0';
-    return result;
+// 일반적인 속성을 위한 헬퍼 매크로
+#define FIND_ATTR_NAME(xml, buf, sz) find_attribute(xml, "name=", 5, buf, sz)
+#define FIND_ATTR_SHEET_ID(xml, buf, sz) find_attribute(xml, "sheetId=", 8, buf, sz)
+#define FIND_ATTR_REL_ID(xml, buf, sz) find_attribute(xml, "r:id=", 5, buf, sz)
+#define FIND_ATTR_R(xml, buf, sz) find_attribute(xml, "r=", 2, buf, sz)
+#define FIND_ATTR_S(xml, buf, sz) find_attribute(xml, "s=", 2, buf, sz)
+#define FIND_ATTR_T(xml, buf, sz) find_attribute(xml, "t=", 2, buf, sz)
+#define FIND_ATTR_ID(xml, buf, sz) find_attribute(xml, "Id=", 3, buf, sz)
+#define FIND_ATTR_TARGET(xml, buf, sz) find_attribute(xml, "Target=", 7, buf, sz)
+#define FIND_ATTR_TYPE(xml, buf, sz) find_attribute(xml, "Type=", 5, buf, sz)
+#define FIND_ATTR_NUMFMT_ID(xml, buf, sz) find_attribute(xml, "numFmtId=", 9, buf, sz)
+#define FIND_ATTR_FORMAT_CODE(xml, buf, sz) find_attribute(xml, "formatCode=", 11, buf, sz)
+#define FIND_ATTR_MIN(xml, buf, sz) find_attribute(xml, "min=", 4, buf, sz)
+#define FIND_ATTR_MAX(xml, buf, sz) find_attribute(xml, "max=", 4, buf, sz)
+#define FIND_ATTR_HIDDEN(xml, buf, sz) find_attribute(xml, "hidden=", 7, buf, sz)
+#define FIND_ATTR_REF(xml, buf, sz) find_attribute(xml, "ref=", 4, buf, sz)
+
+static inline bool is_xml_name_char(char c) {
+    return isalnum((unsigned char)c) || c == '_' || c == ':' || c == '-' || c == '.';
 }
 
-// Initialize shared strings
+static const char* find_tag_end_in_range(const char* tag_start, const char* end) {
+    char quote = '\0';
+
+    for (const char* pos = tag_start; pos < end; pos++) {
+        if (quote) {
+            if (*pos == quote) {
+                quote = '\0';
+            }
+            continue;
+        }
+
+        if (*pos == '"' || *pos == '\'') {
+            quote = *pos;
+            continue;
+        }
+
+        if (*pos == '>') {
+            return pos;
+        }
+    }
+
+    return NULL;
+}
+
+static bool tag_has_local_name(const char* tag_start, const char* name, bool closing) {
+    const char* pos = tag_start + 1;
+    if (closing) {
+        if (*pos != '/') {
+            return false;
+        }
+        pos++;
+    } else if (*pos == '/') {
+        return false;
+    }
+
+    if (*pos == '!' || *pos == '?') {
+        return false;
+    }
+
+    const char* name_start = pos;
+    while (is_xml_name_char(*pos)) {
+        pos++;
+    }
+
+    if (pos == name_start) {
+        return false;
+    }
+
+    const char* local_name = name_start;
+    for (const char* p = name_start; p < pos; p++) {
+        if (*p == ':') {
+            local_name = p + 1;
+        }
+    }
+
+    size_t local_len = (size_t)(pos - local_name);
+    size_t expected_len = strlen(name);
+    if (local_len != expected_len) {
+        return false;
+    }
+
+    return strncmp(local_name, name, expected_len) == 0;
+}
+
+static const char* find_next_tag_local(const char* pos, const char* end,
+                                       const char* name, bool closing) {
+    while (pos < end) {
+        const char* tag_start = memchr(pos, '<', (size_t)(end - pos));
+        if (!tag_start) {
+            return NULL;
+        }
+
+        if (tag_has_local_name(tag_start, name, closing)) {
+            return tag_start;
+        }
+
+        pos = tag_start + 1;
+    }
+
+    return NULL;
+}
+
+static inline const char* find_next_start_tag_local(const char* pos, const char* end, const char* name) {
+    return find_next_tag_local(pos, end, name, false);
+}
+
+static inline const char* find_next_end_tag_local(const char* pos, const char* end, const char* name) {
+    return find_next_tag_local(pos, end, name, true);
+}
+
+static bool is_self_closing_tag(const char* tag_start, const char* tag_end) {
+    const char* pos = tag_end - 1;
+    while (pos > tag_start && isspace((unsigned char)*pos)) {
+        pos--;
+    }
+    return *pos == '/';
+}
+
+static void copy_tag_range(const char* start, const char* end, char* buffer, int max_len) {
+    size_t len = (size_t)(end - start + 1);
+    if (len >= (size_t)max_len) {
+        len = (size_t)max_len - 1;
+    }
+    memcpy(buffer, start, len);
+    buffer[len] = '\0';
+}
+
+static int append_text_range(const char* start, const char* end, char* out, int out_pos, int max_len) {
+    while (start < end && out_pos < max_len - 1) {
+        out[out_pos++] = *start++;
+    }
+    out[out_pos] = '\0';
+    return out_pos;
+}
+
+static int extract_first_tag_text(const char* start, const char* end,
+                                  const char* tag_name, char* out, int max_len) {
+    const char* tag_start = find_next_start_tag_local(start, end, tag_name);
+    if (!tag_start) {
+        return 0;
+    }
+
+    const char* tag_end = find_tag_end_in_range(tag_start, end);
+    if (!tag_end) {
+        return 0;
+    }
+
+    if (is_self_closing_tag(tag_start, tag_end)) {
+        out[0] = '\0';
+        return 1;
+    }
+
+    const char* close_start = find_next_end_tag_local(tag_end + 1, end, tag_name);
+    if (!close_start) {
+        return 0;
+    }
+
+    int out_pos = append_text_range(tag_end + 1, close_start, out, 0, max_len);
+    out[out_pos] = '\0';
+    unescape_xml_entities(out);
+    return 1;
+}
+
+static int extract_text_runs(const char* start, const char* end, char* out, int max_len) {
+    const char* pos = start;
+    int out_pos = 0;
+    int found = 0;
+    out[0] = '\0';
+
+    while ((pos = find_next_start_tag_local(pos, end, "t")) != NULL) {
+        const char* tag_end = find_tag_end_in_range(pos, end);
+        if (!tag_end) {
+            break;
+        }
+
+        if (is_self_closing_tag(pos, tag_end)) {
+            pos = tag_end + 1;
+            continue;
+        }
+
+        const char* close_start = find_next_end_tag_local(tag_end + 1, end, "t");
+        if (!close_start) {
+            break;
+        }
+
+        out_pos = append_text_range(tag_end + 1, close_start, out, out_pos, max_len);
+        found = 1;
+
+        const char* close_end = find_tag_end_in_range(close_start, end);
+        if (!close_end) {
+            break;
+        }
+        pos = close_end + 1;
+    }
+
+    if (found) {
+        out[out_pos] = '\0';
+        unescape_xml_entities(out);
+    }
+
+    return found;
+}
+
+static int extract_inline_string_text(const char* start, const char* end, char* out, int max_len) {
+    const char* is_start = find_next_start_tag_local(start, end, "is");
+    if (!is_start) {
+        return extract_text_runs(start, end, out, max_len);
+    }
+
+    const char* is_tag_end = find_tag_end_in_range(is_start, end);
+    if (!is_tag_end) {
+        return 0;
+    }
+
+    if (is_self_closing_tag(is_start, is_tag_end)) {
+        out[0] = '\0';
+        return 1;
+    }
+
+    const char* is_close = find_next_end_tag_local(is_tag_end + 1, end, "is");
+    if (!is_close) {
+        return 0;
+    }
+
+    return extract_text_runs(is_tag_end + 1, is_close, out, max_len);
+}
+
+static CellFormat make_raw_cell_format(void) {
+    CellFormat format;
+    format.kind = FORMAT_KIND_RAW;
+    format.decimals = 0;
+    format.zero_width = 0;
+    format.use_thousands = false;
+    format.show_seconds = false;
+    return format;
+}
+
+void init_styles(Styles* styles) {
+    styles->custom_formats = NULL;
+    styles->custom_count = 0;
+    styles->custom_capacity = 0;
+    styles->xf_formats = NULL;
+    styles->xf_count = 0;
+    styles->xf_capacity = 0;
+    styles->date_1904 = false;
+    styles->enabled = false;
+}
+
+void free_styles(Styles* styles) {
+    for (int i = 0; i < styles->custom_count; i++) {
+        free(styles->custom_formats[i].format_code);
+    }
+    free(styles->custom_formats);
+    free(styles->xf_formats);
+    init_styles(styles);
+}
+
+static bool attr_is_true(const char* attr_value) {
+    return attr_value[0] == '1' || attr_value[0] == 't' || attr_value[0] == 'T';
+}
+
+static void init_hidden_columns(HiddenColumns* hidden_columns) {
+    hidden_columns->ranges = NULL;
+    hidden_columns->count = 0;
+    hidden_columns->capacity = 0;
+}
+
+static void free_hidden_columns(HiddenColumns* hidden_columns) {
+    free(hidden_columns->ranges);
+    init_hidden_columns(hidden_columns);
+}
+
+static void add_hidden_column_range(HiddenColumns* hidden_columns, int start_col, int end_col) {
+    if (start_col > end_col) {
+        return;
+    }
+
+    if (hidden_columns->count >= hidden_columns->capacity) {
+        hidden_columns->capacity = hidden_columns->capacity ? hidden_columns->capacity * 2 : 8;
+        hidden_columns->ranges = realloc(hidden_columns->ranges,
+                                         sizeof(HiddenColumnRange) * hidden_columns->capacity);
+    }
+
+    hidden_columns->ranges[hidden_columns->count].start_col = start_col;
+    hidden_columns->ranges[hidden_columns->count].end_col = end_col;
+    hidden_columns->count++;
+}
+
+static bool is_hidden_column(const HiddenColumns* hidden_columns, int col) {
+    for (int i = 0; i < hidden_columns->count; i++) {
+        if (col >= hidden_columns->ranges[i].start_col && col <= hidden_columns->ranges[i].end_col) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void init_merge_regions(MergeRegions* merge_regions) {
+    merge_regions->regions = NULL;
+    merge_regions->count = 0;
+    merge_regions->capacity = 0;
+}
+
+static void free_merge_regions(MergeRegions* merge_regions) {
+    free(merge_regions->regions);
+    init_merge_regions(merge_regions);
+}
+
+static void add_merge_region(MergeRegions* merge_regions,
+                             int start_row, int end_row, int start_col, int end_col) {
+    if (start_row > end_row || start_col > end_col) {
+        return;
+    }
+
+    if (merge_regions->count >= merge_regions->capacity) {
+        merge_regions->capacity = merge_regions->capacity ? merge_regions->capacity * 2 : 8;
+        merge_regions->regions = realloc(merge_regions->regions,
+                                         sizeof(MergeRegion) * merge_regions->capacity);
+    }
+
+    MergeRegion* region = &merge_regions->regions[merge_regions->count++];
+    region->start_row = start_row;
+    region->end_row = end_row;
+    region->start_col = start_col;
+    region->end_col = end_col;
+    region->value[0] = '\0';
+    region->value_set = false;
+}
+
+static void init_row_buffer(RowBuffer* row_buffer) {
+    row_buffer->cells = NULL;
+    row_buffer->count = 0;
+    row_buffer->capacity = 0;
+}
+
+static void clear_row_buffer(RowBuffer* row_buffer) {
+    for (int i = 0; i < row_buffer->count; i++) {
+        free(row_buffer->cells[i].value);
+        row_buffer->cells[i].value = NULL;
+    }
+    row_buffer->count = 0;
+}
+
+static void free_row_buffer(RowBuffer* row_buffer) {
+    clear_row_buffer(row_buffer);
+    free(row_buffer->cells);
+    init_row_buffer(row_buffer);
+}
+
+static void ensure_row_buffer_capacity(RowBuffer* row_buffer, int needed) {
+    if (needed <= row_buffer->capacity) {
+        return;
+    }
+
+    int new_capacity = row_buffer->capacity ? row_buffer->capacity * 2 : 16;
+    while (new_capacity < needed) {
+        new_capacity *= 2;
+    }
+
+    row_buffer->cells = realloc(row_buffer->cells, sizeof(RowCell) * new_capacity);
+    row_buffer->capacity = new_capacity;
+}
+
+static int find_row_cell_index(const RowBuffer* row_buffer, int col) {
+    for (int i = 0; i < row_buffer->count; i++) {
+        if (row_buffer->cells[i].col == col) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static void add_row_cell(RowBuffer* row_buffer, int col, const char* value) {
+    int existing_index = find_row_cell_index(row_buffer, col);
+    if (existing_index >= 0) {
+        free(row_buffer->cells[existing_index].value);
+        row_buffer->cells[existing_index].value = strdup(value);
+        return;
+    }
+
+    ensure_row_buffer_capacity(row_buffer, row_buffer->count + 1);
+    row_buffer->cells[row_buffer->count].col = col;
+    row_buffer->cells[row_buffer->count].value = strdup(value);
+    row_buffer->count++;
+}
+
+static void add_row_cell_if_missing(RowBuffer* row_buffer, int col, const char* value) {
+    if (find_row_cell_index(row_buffer, col) >= 0) {
+        return;
+    }
+    add_row_cell(row_buffer, col, value);
+}
+
+static int compare_row_cells(const void* left, const void* right) {
+    const RowCell* a = left;
+    const RowCell* b = right;
+    if (a->col < b->col) return -1;
+    if (a->col > b->col) return 1;
+    return 0;
+}
+
+static void sort_row_buffer(RowBuffer* row_buffer) {
+    if (row_buffer->count > 1) {
+        qsort(row_buffer->cells, row_buffer->count, sizeof(RowCell), compare_row_cells);
+    }
+}
+
+static void add_custom_num_format(Styles* styles, int num_fmt_id, const char* format_code) {
+    if (styles->custom_count >= styles->custom_capacity) {
+        styles->custom_capacity = styles->custom_capacity ? styles->custom_capacity * 2 : 16;
+        styles->custom_formats = realloc(styles->custom_formats,
+                                         sizeof(CustomNumFormat) * styles->custom_capacity);
+    }
+
+    styles->custom_formats[styles->custom_count].num_fmt_id = num_fmt_id;
+    styles->custom_formats[styles->custom_count].format_code = strdup(format_code);
+    styles->custom_count++;
+}
+
+static const char* find_custom_num_format(const Styles* styles, int num_fmt_id) {
+    for (int i = 0; i < styles->custom_count; i++) {
+        if (styles->custom_formats[i].num_fmt_id == num_fmt_id) {
+            return styles->custom_formats[i].format_code;
+        }
+    }
+    return NULL;
+}
+
+static void add_xf_format(Styles* styles, CellFormat format) {
+    if (styles->xf_count >= styles->xf_capacity) {
+        styles->xf_capacity = styles->xf_capacity ? styles->xf_capacity * 2 : 32;
+        styles->xf_formats = realloc(styles->xf_formats, sizeof(CellFormat) * styles->xf_capacity);
+    }
+
+    styles->xf_formats[styles->xf_count++] = format;
+}
+
+static bool workbook_uses_1904_date_system(const char* xml_data) {
+    const char* workbook_pr = strstr(xml_data, "<workbookPr");
+    char date_attr[16];
+    if (!workbook_pr) {
+        return false;
+    }
+
+    if (find_attribute(workbook_pr, "date1904=", 9, date_attr, sizeof(date_attr)) < 0) {
+        return false;
+    }
+
+    return date_attr[0] == '1' || date_attr[0] == 't' || date_attr[0] == 'T';
+}
+
+static const char* builtin_number_format_code(int num_fmt_id) {
+    switch (num_fmt_id) {
+        case 1: return "0";
+        case 2: return "0.00";
+        case 3: return "#,##0";
+        case 4: return "#,##0.00";
+        case 9: return "0%";
+        case 10: return "0.00%";
+        case 11: return "0.00E+00";
+        case 14: return "mm-dd-yy";
+        case 15: return "d-mmm-yy";
+        case 16: return "d-mmm";
+        case 17: return "mmm-yy";
+        case 18: return "h:mm AM/PM";
+        case 19: return "h:mm:ss AM/PM";
+        case 20: return "h:mm";
+        case 21: return "h:mm:ss";
+        case 22: return "m/d/yy h:mm";
+        case 45: return "mm:ss";
+        case 46: return "[h]:mm:ss";
+        case 47: return "mmss.0";
+        case 48: return "##0.0E+0";
+        case 49: return "@";
+        default: return NULL;
+    }
+}
+
+static void sanitize_number_format_code(const char* format_code, char* out, int max_len, bool* elapsed_time) {
+    int out_pos = 0;
+    *elapsed_time = false;
+
+    for (int i = 0; format_code[i] != '\0' && out_pos < max_len - 1; i++) {
+        char c = format_code[i];
+
+        if (c == ';') {
+            break;
+        }
+
+        if (c == '"') {
+            i++;
+            while (format_code[i] && format_code[i] != '"') {
+                i++;
+            }
+            continue;
+        }
+
+        if (c == '\\' || c == '_' || c == '*') {
+            if (format_code[i + 1] != '\0') {
+                i++;
+            }
+            continue;
+        }
+
+        if (c == '[') {
+            int j = i + 1;
+            while (format_code[j] && format_code[j] != ']') {
+                j++;
+            }
+
+            if (!format_code[j]) {
+                break;
+            }
+
+            if (j == i + 2 || j == i + 3) {
+                char token0 = (char)tolower((unsigned char)format_code[i + 1]);
+                if (token0 == 'h' || token0 == 'm' || token0 == 's') {
+                    *elapsed_time = true;
+                    while (++i < j && out_pos < max_len - 1) {
+                        out[out_pos++] = (char)tolower((unsigned char)format_code[i]);
+                    }
+                    i = j;
+                    continue;
+                }
+            }
+
+            i = j;
+            continue;
+        }
+
+        out[out_pos++] = (char)tolower((unsigned char)c);
+    }
+
+    out[out_pos] = '\0';
+}
+
+static int count_format_decimals(const char* sanitized_code) {
+    const char* dot = strchr(sanitized_code, '.');
+    if (!dot) {
+        return 0;
+    }
+
+    int decimals = 0;
+    for (const char* pos = dot + 1; *pos; pos++) {
+        if (*pos == '0' || *pos == '#') {
+            decimals++;
+            continue;
+        }
+        if (*pos == '%' || *pos == 'e') {
+            break;
+        }
+        if (!isdigit((unsigned char)*pos) && *pos != ',' && *pos != '?') {
+            break;
+        }
+    }
+    return decimals;
+}
+
+static bool is_zero_pad_format(const char* sanitized_code, int* zero_width) {
+    int width = 0;
+    if (sanitized_code[0] == '\0') {
+        return false;
+    }
+
+    for (const char* pos = sanitized_code; *pos; pos++) {
+        if (*pos != '0') {
+            return false;
+        }
+        width++;
+    }
+
+    *zero_width = width;
+    return width > 0;
+}
+
+static bool format_has_numeric_placeholders(const char* sanitized_code) {
+    return strpbrk(sanitized_code, "0#?") != NULL;
+}
+
+static CellFormat analyze_number_format(int num_fmt_id, const char* format_code) {
+    CellFormat format = make_raw_cell_format();
+    bool elapsed_time = false;
+    char sanitized[256];
+    int zero_width = 0;
+
+    if (!format_code || format_code[0] == '\0') {
+        return format;
+    }
+
+    sanitize_number_format_code(format_code, sanitized, sizeof(sanitized), &elapsed_time);
+
+    if (sanitized[0] == '@' && sanitized[1] == '\0') {
+        return format;
+    }
+
+    bool has_am_pm = strstr(sanitized, "am/pm") != NULL || strstr(sanitized, "a/p") != NULL;
+    bool has_hour = strchr(sanitized, 'h') != NULL;
+    bool has_second = strchr(sanitized, 's') != NULL;
+    bool has_year = strchr(sanitized, 'y') != NULL;
+    bool has_day = strchr(sanitized, 'd') != NULL;
+    bool has_month = strchr(sanitized, 'm') != NULL;
+    bool has_time = has_hour || has_second || has_am_pm;
+    bool has_date = has_year || has_day || (has_month && !has_time);
+
+    if (has_month && has_time) {
+        has_time = true;
+    }
+
+    if (has_date || has_time || elapsed_time ||
+        (num_fmt_id >= 27 && num_fmt_id <= 36) ||
+        (num_fmt_id >= 50 && num_fmt_id <= 58)) {
+        if (elapsed_time) {
+            format.kind = FORMAT_KIND_DURATION;
+            format.show_seconds = has_second || num_fmt_id == 46;
+            return format;
+        }
+
+        if (has_date && has_time) {
+            format.kind = FORMAT_KIND_DATETIME;
+            format.show_seconds = has_second;
+            return format;
+        }
+
+        if (has_time) {
+            format.kind = FORMAT_KIND_TIME;
+            format.show_seconds = has_second;
+            return format;
+        }
+
+        format.kind = FORMAT_KIND_DATE;
+        return format;
+    }
+
+    if (strstr(sanitized, "e+") || strstr(sanitized, "e-")) {
+        format.kind = FORMAT_KIND_SCIENTIFIC;
+        format.decimals = count_format_decimals(sanitized);
+        return format;
+    }
+
+    if (strchr(sanitized, '%')) {
+        format.kind = FORMAT_KIND_PERCENT;
+        format.decimals = count_format_decimals(sanitized);
+        return format;
+    }
+
+    if (is_zero_pad_format(sanitized, &zero_width)) {
+        format.kind = FORMAT_KIND_ZERO_PAD;
+        format.zero_width = zero_width;
+        return format;
+    }
+
+    if (format_has_numeric_placeholders(sanitized)) {
+        format.kind = FORMAT_KIND_NUMBER;
+        format.decimals = count_format_decimals(sanitized);
+        format.use_thousands = strchr(sanitized, ',') != NULL;
+    }
+
+    return format;
+}
+
+static CellFormat resolve_cell_format(const Styles* styles, int num_fmt_id) {
+    const char* format_code = find_custom_num_format(styles, num_fmt_id);
+    if (!format_code) {
+        format_code = builtin_number_format_code(num_fmt_id);
+    }
+    return analyze_number_format(num_fmt_id, format_code);
+}
+
+void parse_styles_xml(const char* xml_data, Styles* styles) {
+    const char* xml_end = xml_data + strlen(xml_data);
+    const char* numfmts_start = find_next_start_tag_local(xml_data, xml_end, "numFmts");
+    const char* cellxfs_start = find_next_start_tag_local(xml_data, xml_end, "cellXfs");
+    char tag_buffer[512];
+    char id_attr[32];
+    char code_attr[256];
+
+    if (numfmts_start) {
+        const char* numfmts_tag_end = find_tag_end_in_range(numfmts_start, xml_end);
+        const char* numfmts_end = numfmts_tag_end ? find_next_end_tag_local(numfmts_tag_end + 1, xml_end, "numFmts") : NULL;
+        const char* pos = numfmts_tag_end ? numfmts_tag_end + 1 : NULL;
+
+        while (pos && numfmts_end && (pos = find_next_start_tag_local(pos, numfmts_end, "numFmt")) != NULL) {
+            const char* tag_end = find_tag_end_in_range(pos, numfmts_end);
+            if (!tag_end) {
+                break;
+            }
+
+            copy_tag_range(pos, tag_end, tag_buffer, sizeof(tag_buffer));
+            if (FIND_ATTR_NUMFMT_ID(tag_buffer, id_attr, sizeof(id_attr)) >= 0 &&
+                FIND_ATTR_FORMAT_CODE(tag_buffer, code_attr, sizeof(code_attr)) >= 0) {
+                unescape_xml_entities(code_attr);
+                add_custom_num_format(styles, atoi(id_attr), code_attr);
+            }
+
+            pos = tag_end + 1;
+        }
+    }
+
+    if (!cellxfs_start) {
+        return;
+    }
+
+    const char* cellxfs_tag_end = find_tag_end_in_range(cellxfs_start, xml_end);
+    const char* cellxfs_end = cellxfs_tag_end ? find_next_end_tag_local(cellxfs_tag_end + 1, xml_end, "cellXfs") : NULL;
+    const char* pos = cellxfs_tag_end ? cellxfs_tag_end + 1 : NULL;
+
+    while (pos && cellxfs_end && (pos = find_next_start_tag_local(pos, cellxfs_end, "xf")) != NULL) {
+        const char* tag_end = find_tag_end_in_range(pos, cellxfs_end);
+        if (!tag_end) {
+            break;
+        }
+
+        copy_tag_range(pos, tag_end, tag_buffer, sizeof(tag_buffer));
+        int num_fmt_id = 0;
+        if (FIND_ATTR_NUMFMT_ID(tag_buffer, id_attr, sizeof(id_attr)) >= 0) {
+            num_fmt_id = atoi(id_attr);
+        }
+
+        add_xf_format(styles, resolve_cell_format(styles, num_fmt_id));
+        pos = tag_end + 1;
+    }
+}
+
+static int64_t floor_double_to_i64(double value) {
+    int64_t truncated = (int64_t)value;
+    if ((double)truncated > value) {
+        truncated--;
+    }
+    return truncated;
+}
+
+static int64_t days_from_civil(int year, unsigned month, unsigned day) {
+    year -= month <= 2;
+    const int era = (year >= 0 ? year : year - 399) / 400;
+    const unsigned yoe = (unsigned)(year - era * 400);
+    const unsigned doy = (153 * (month + (month > 2 ? -3 : 9)) + 2) / 5 + day - 1;
+    const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + (int)doe - 719468;
+}
+
+static void civil_from_days(int64_t z, int* year, unsigned* month, unsigned* day) {
+    z += 719468;
+    const int era = (z >= 0 ? z : z - 146096) / 146097;
+    const unsigned doe = (unsigned)(z - era * 146097);
+    const unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    const int y = (int)yoe + era * 400;
+    const unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    const unsigned mp = (5 * doy + 2) / 153;
+
+    *day = doy - (153 * mp + 2) / 5 + 1;
+    *month = mp + (mp < 10 ? 3 : -9);
+    *year = y + (*month <= 2);
+}
+
+static bool excel_serial_to_datetime(double serial, bool date_1904,
+                                     int* year, int* month, int* day,
+                                     int* hour, int* minute, int* second) {
+    int64_t days = floor_double_to_i64(serial);
+    double fractional = serial - (double)days;
+
+    if (fractional < 0.0) {
+        fractional += 1.0;
+        days--;
+    }
+
+    int total_seconds = (int)(fractional * 86400.0 + 0.5);
+    if (total_seconds >= 86400) {
+        total_seconds -= 86400;
+        days++;
+    }
+
+    if (!date_1904 && days == 60) {
+        *year = 1900;
+        *month = 2;
+        *day = 29;
+    } else {
+        int64_t adjusted_days = days;
+        int64_t base_days = date_1904 ? days_from_civil(1904, 1, 1) : days_from_civil(1899, 12, 31);
+
+        if (!date_1904 && days > 60) {
+            adjusted_days--;
+        }
+
+        unsigned out_month;
+        unsigned out_day;
+        civil_from_days(base_days + adjusted_days, year, &out_month, &out_day);
+        *month = (int)out_month;
+        *day = (int)out_day;
+    }
+
+    *hour = total_seconds / 3600;
+    *minute = (total_seconds % 3600) / 60;
+    *second = total_seconds % 60;
+    return true;
+}
+
+static void append_thousands_separators(const char* input, char* output, int max_len) {
+    const char* digits = input;
+    char sign = '\0';
+    int out_pos = 0;
+
+    if (*digits == '-' || *digits == '+') {
+        sign = *digits++;
+        if (out_pos < max_len - 1) {
+            output[out_pos++] = sign;
+        }
+    }
+
+    const char* dot = strchr(digits, '.');
+    int int_len = dot ? (int)(dot - digits) : (int)strlen(digits);
+
+    for (int i = 0; i < int_len && out_pos < max_len - 1; i++) {
+        if (i > 0 && ((int_len - i) % 3 == 0)) {
+            output[out_pos++] = ',';
+        }
+        output[out_pos++] = digits[i];
+    }
+
+    if (dot) {
+        for (const char* pos = dot; *pos && out_pos < max_len - 1; pos++) {
+            output[out_pos++] = *pos;
+        }
+    }
+
+    output[out_pos] = '\0';
+}
+
+static void format_fixed_number(double value, int decimals, bool use_thousands, char* output, int max_len) {
+    char buffer[128];
+    snprintf(buffer, sizeof(buffer), "%.*f", decimals, value);
+
+    if (use_thousands) {
+        append_thousands_separators(buffer, output, max_len);
+    } else {
+        strncpy(output, buffer, max_len - 1);
+        output[max_len - 1] = '\0';
+    }
+}
+
+static void format_zero_padded_number(double value, int zero_width, char* output, int max_len) {
+    char rounded[128];
+    const char* digits = rounded;
+    bool negative = false;
+    int out_pos = 0;
+
+    snprintf(rounded, sizeof(rounded), "%.0f", value);
+    if (rounded[0] == '-') {
+        negative = true;
+        digits++;
+    }
+
+    if (negative && out_pos < max_len - 1) {
+        output[out_pos++] = '-';
+    }
+
+    int digit_len = (int)strlen(digits);
+    for (int i = digit_len; i < zero_width && out_pos < max_len - 1; i++) {
+        output[out_pos++] = '0';
+    }
+
+    for (int i = 0; digits[i] && out_pos < max_len - 1; i++) {
+        output[out_pos++] = digits[i];
+    }
+
+    output[out_pos] = '\0';
+}
+
+static void format_duration_value(double serial, bool show_seconds, char* output, int max_len) {
+    int64_t total_seconds = floor_double_to_i64(serial * 86400.0 + 0.5);
+    if (total_seconds < 0) {
+        snprintf(output, max_len, "%.10g", serial);
+        return;
+    }
+
+    int64_t hours = total_seconds / 3600;
+    int minutes = (int)((total_seconds % 3600) / 60);
+    int seconds = (int)(total_seconds % 60);
+
+    if (show_seconds) {
+        snprintf(output, max_len, "%lld:%02d:%02d", (long long)hours, minutes, seconds);
+    } else {
+        snprintf(output, max_len, "%lld:%02d", (long long)hours, minutes);
+    }
+}
+
+static bool format_numeric_value(double value, CellFormat format, bool date_1904, char* output, int max_len) {
+    int year, month, day, hour, minute, second;
+
+    switch (format.kind) {
+        case FORMAT_KIND_RAW:
+            return false;
+
+        case FORMAT_KIND_NUMBER:
+            format_fixed_number(value, format.decimals, format.use_thousands, output, max_len);
+            return true;
+
+        case FORMAT_KIND_PERCENT:
+            format_fixed_number(value * 100.0, format.decimals, false, output, max_len - 1);
+            strncat(output, "%", (size_t)max_len - strlen(output) - 1);
+            return true;
+
+        case FORMAT_KIND_SCIENTIFIC:
+            snprintf(output, max_len, "%.*E", format.decimals, value);
+            return true;
+
+        case FORMAT_KIND_ZERO_PAD:
+            format_zero_padded_number(value, format.zero_width, output, max_len);
+            return true;
+
+        case FORMAT_KIND_DATE:
+        case FORMAT_KIND_TIME:
+        case FORMAT_KIND_DATETIME:
+            excel_serial_to_datetime(value, date_1904, &year, &month, &day, &hour, &minute, &second);
+            if (format.kind == FORMAT_KIND_DATE) {
+                snprintf(output, max_len, "%04d-%02d-%02d", year, month, day);
+            } else if (format.kind == FORMAT_KIND_TIME) {
+                if (format.show_seconds) {
+                    snprintf(output, max_len, "%02d:%02d:%02d", hour, minute, second);
+                } else {
+                    snprintf(output, max_len, "%02d:%02d", hour, minute);
+                }
+            } else if (format.show_seconds) {
+                snprintf(output, max_len, "%04d-%02d-%02d %02d:%02d:%02d",
+                         year, month, day, hour, minute, second);
+            } else {
+                snprintf(output, max_len, "%04d-%02d-%02d %02d:%02d",
+                         year, month, day, hour, minute);
+            }
+            return true;
+
+        case FORMAT_KIND_DURATION:
+            format_duration_value(value, format.show_seconds, output, max_len);
+            return true;
+    }
+
+    return false;
+}
+
+static void format_generic_scalar(const char* raw_value, bool has_type_attr, const char* type_attr,
+                                  int style_index, const Styles* styles, bool formatted_output,
+                                  char* output, int max_len) {
+    if (formatted_output && has_type_attr && strcmp(type_attr, "b") == 0) {
+        if (strcmp(raw_value, "1") == 0) {
+            escape_tsv_value("TRUE", output, max_len);
+        } else if (strcmp(raw_value, "0") == 0) {
+            escape_tsv_value("FALSE", output, max_len);
+        } else {
+            escape_tsv_value(raw_value, output, max_len);
+        }
+        return;
+    }
+
+    if (!formatted_output || !styles || !styles->enabled ||
+        (has_type_attr && (strcmp(type_attr, "e") == 0 || strcmp(type_attr, "str") == 0 || strcmp(type_attr, "d") == 0))) {
+        escape_tsv_value(raw_value, output, max_len);
+        return;
+    }
+
+    char* end_ptr = NULL;
+    double numeric_value = strtod(raw_value, &end_ptr);
+    if (!end_ptr || *end_ptr != '\0') {
+        escape_tsv_value(raw_value, output, max_len);
+        return;
+    }
+
+    CellFormat format = make_raw_cell_format();
+    if (style_index >= 0 && style_index < styles->xf_count) {
+        format = styles->xf_formats[style_index];
+    }
+
+    if (!format_numeric_value(numeric_value, format, styles->date_1904, output, max_len)) {
+        escape_tsv_value(raw_value, output, max_len);
+    }
+}
+
+// 공유 문자열 초기화
 void init_shared_strings(SharedStrings* ss) {
-    ss->capacity = 65535;
+    ss->capacity = 1024;  // 작게 시작, 필요에 따라 확장
     ss->strings = malloc(sizeof(char*) * ss->capacity);
     ss->count = 0;
 }
 
-// Unescape XML entities in-place
+// XML 엔티티를 제자리에서 언이스케이프 - 최적화 버전
 void unescape_xml_entities(char* str) {
     char* src = str;
     char* dst = str;
-    
+
     while (*src) {
         if (*src == '&') {
-            if (strncmp(src, "&lt;", 4) == 0) {
-                *dst++ = '<';
-                src += 4;
-            } else if (strncmp(src, "&gt;", 4) == 0) {
-                *dst++ = '>';
-                src += 4;
-            } else if (strncmp(src, "&amp;", 5) == 0) {
-                *dst++ = '&';
-                src += 5;
-            } else if (strncmp(src, "&quot;", 6) == 0) {
-                *dst++ = '"';
-                src += 6;
-            } else if (strncmp(src, "&apos;", 6) == 0) {
-                *dst++ = '\'';
-                src += 6;
-            } else {
-                *dst++ = *src++;
+            // 비교 횟수를 줄이기 위해 두 번째 문자를 먼저 확인
+            switch (src[1]) {
+                case 'l':  // &lt;
+                    if (src[2] == 't' && src[3] == ';') {
+                        *dst++ = '<';
+                        src += 4;
+                    } else {
+                        *dst++ = *src++;
+                    }
+                    break;
+                case 'g':  // &gt;
+                    if (src[2] == 't' && src[3] == ';') {
+                        *dst++ = '>';
+                        src += 4;
+                    } else {
+                        *dst++ = *src++;
+                    }
+                    break;
+                case 'a':  // &amp; 또는 &apos;
+                    if (src[2] == 'm' && src[3] == 'p' && src[4] == ';') {
+                        *dst++ = '&';
+                        src += 5;
+                    } else if (src[2] == 'p' && src[3] == 'o' && src[4] == 's' && src[5] == ';') {
+                        *dst++ = '\'';
+                        src += 6;
+                    } else {
+                        *dst++ = *src++;
+                    }
+                    break;
+                case 'q':  // &quot;
+                    if (src[2] == 'u' && src[3] == 'o' && src[4] == 't' && src[5] == ';') {
+                        *dst++ = '"';
+                        src += 6;
+                    } else {
+                        *dst++ = *src++;
+                    }
+                    break;
+                default:
+                    *dst++ = *src++;
+                    break;
             }
         } else {
             *dst++ = *src++;
@@ -121,128 +1181,203 @@ void unescape_xml_entities(char* str) {
     *dst = '\0';
 }
 
-// Add string to shared strings
+// 공유 문자열에 문자열 추가
 void add_shared_string(SharedStrings* ss, const char* str) {
     if (ss->count >= ss->capacity) {
         ss->capacity *= 2;
         ss->strings = realloc(ss->strings, sizeof(char*) * ss->capacity);
     }
-    
-    ss->strings[ss->count] = malloc(strlen(str) + 1);
-    strcpy(ss->strings[ss->count], str);
-    
-    // Unescape XML entities
+
+    ss->strings[ss->count] = strdup(str);
+
+    // XML 엔티티 언이스케이프
     unescape_xml_entities(ss->strings[ss->count]);
-    
+
     ss->count++;
 
-    // Debug: Print first 30 shared strings
+    // 디버그: 처음 30개 공유 문자열 출력
 #ifdef DEBUG
     printf("DEBUG: Shared string [%d] = '%s'\n", ss->count - 1, ss->strings[ss->count - 1]);
 #endif
 }
 
-// Parse shared strings XML by extracting text content and skipping all tags
+// 텍스트 내용을 추출하고 모든 태그를 건너뛰며 공유 문자열 XML 파싱
 void parse_shared_strings(const char* xml_data, SharedStrings* ss) {
     const char* pos = xml_data;
-    
-    // Find each <si> (shared string item) element
+
+    // 각 <si> (공유 문자열 항목) 요소 찾기
     while ((pos = strstr(pos, "<si")) != NULL) {
-        // Check for self-closing tag <si/>
+        // 자기 닫힘 태그 <si/> 확인
         const char* tag_end = strchr(pos, '>');
         if (!tag_end) break;
-        
+
         if (*(tag_end - 1) == '/') {
-            // Self-closing tag <si/> - represents empty string
+            // 자기 닫힘 태그 <si/> - 빈 문자열을 나타냄
             add_shared_string(ss, "");
             pos = tag_end + 1;
             continue;
         }
-        
-        // Regular <si>...</si> tag
+
+        // 일반 <si>...</si> 태그
         if (*(pos + 3) != '>') {
-            // Skip if not exactly "<si>"
+            // 정확히 "<si>"가 아니면 건너뛰기
             pos++;
             continue;
         }
-        
-        pos += 4; // Skip <si>
+
+        pos += 4; // <si> 건너뛰기
         const char* si_end = strstr(pos, "</si>");
         if (!si_end) break;
-        
-        // Extract text content, skipping all tags
+
+        // 모든 태그를 건너뛰고 텍스트 내용 추출
         char text_buffer[MAX_CELL_VALUE] = "";
         int buffer_pos = 0;
         const char* current = pos;
         int inside_tag = 0;
-        
+
         while (current < si_end && buffer_pos < MAX_CELL_VALUE - 1) {
             if (*current == '<') {
-                inside_tag = 1;  // Start of a tag
+                inside_tag = 1;  // 태그 시작
             } else if (*current == '>') {
-                inside_tag = 0;  // End of a tag
+                inside_tag = 0;  // 태그 끝
             } else if (!inside_tag) {
-                // Not inside a tag, add character to buffer
+                // 태그 안이 아니면 버퍼에 문자 추가
                 text_buffer[buffer_pos++] = *current;
             }
             current++;
         }
-        
+
         text_buffer[buffer_pos] = '\0';
-        
-        // Add to shared strings (including empty strings to maintain correct indexing)
+
+        // 공유 문자열에 추가 (올바른 인덱싱을 유지하기 위해 빈 문자열 포함)
         add_shared_string(ss, text_buffer);
-        
-        pos = si_end + 5; // Move past </si>
+
+        pos = si_end + 5; // </si>를 지나서 이동
     }
 }
 
-// Parse workbook.xml to get sheet information
-void parse_workbook(const char* xml_data, Workbook* wb) {
+void parse_shared_strings_generic(const char* xml_data, SharedStrings* ss) {
+    const char* xml_end = xml_data + strlen(xml_data);
+    const char* pos = xml_data;
+
+    while ((pos = find_next_start_tag_local(pos, xml_end, "si")) != NULL) {
+        const char* si_tag_end = find_tag_end_in_range(pos, xml_end);
+        if (!si_tag_end) {
+            break;
+        }
+
+        if (is_self_closing_tag(pos, si_tag_end)) {
+            add_shared_string(ss, "");
+            pos = si_tag_end + 1;
+            continue;
+        }
+
+        const char* si_close = find_next_end_tag_local(si_tag_end + 1, xml_end, "si");
+        if (!si_close) {
+            break;
+        }
+
+        char text_buffer[MAX_CELL_VALUE] = "";
+        extract_text_runs(si_tag_end + 1, si_close, text_buffer, sizeof(text_buffer));
+        add_shared_string(ss, text_buffer);
+
+        const char* si_close_end = find_tag_end_in_range(si_close, xml_end);
+        if (!si_close_end) {
+            break;
+        }
+        pos = si_close_end + 1;
+    }
+}
+
+// workbook.xml을 파싱하여 시트 정보 가져오기
+void parse_workbook(const char* xml_data, Workbook* wb, bool export_all_sheets) {
     wb->sheet_count = 0;
     const char* pos = xml_data;
-    
+    char name_attr[MAX_SHEET_NAME];
+    char sheet_id_attr[32];
+    char rel_id_attr[MAX_REL_ID];
+
     while ((pos = strstr(pos, "<sheet ")) != NULL && wb->sheet_count < MAX_SHEETS) {
-        // Extract sheet name
-        char* name_attr = find_attribute(pos, "name=");
-        if (!name_attr) {
+        // 시트 이름 추출
+        if (FIND_ATTR_NAME(pos, name_attr, MAX_SHEET_NAME) < 0) {
             pos++;
             continue;
         }
-        
-        // Extract sheet ID
-        char* sheet_id_attr = find_attribute(pos, "sheetId=");
-        int sheet_id = sheet_id_attr ? atoi(sheet_id_attr) : wb->sheet_count + 1;
-        
-        // Skip sheets with invalid characters (only allow A-Z, a-z, 0-9, -, _, *)
-        if (!is_valid_name(name_attr)) {
+
+        if (FIND_ATTR_REL_ID(pos, rel_id_attr, sizeof(rel_id_attr)) < 0) {
+            pos++;
+            continue;
+        }
+
+        // 시트 ID 추출
+        int sheet_id = wb->sheet_count + 1;
+        if (FIND_ATTR_SHEET_ID(pos, sheet_id_attr, sizeof(sheet_id_attr)) >= 0) {
+            sheet_id = atoi(sheet_id_attr);
+        }
+
+        // 유효하지 않은 문자가 있는 시트 건너뛰기 (A-Z, a-z, 0-9, -, _, *만 허용)
+        if (!export_all_sheets && !is_valid_name(name_attr)) {
             printf("Skipping sheet: '%s' (contains invalid characters - only A-Z, a-z, 0-9, -, _, * allowed)\n", name_attr);
-            free(name_attr);
-            if (sheet_id_attr) free(sheet_id_attr);
             pos++;
             continue;
         }
-        
-        // Store sheet information
+
+        // 시트 정보 저장
         strncpy(wb->sheets[wb->sheet_count].name, name_attr, MAX_SHEET_NAME - 1);
         wb->sheets[wb->sheet_count].name[MAX_SHEET_NAME - 1] = '\0';
+        strncpy(wb->sheets[wb->sheet_count].rel_id, rel_id_attr, MAX_REL_ID - 1);
+        wb->sheets[wb->sheet_count].rel_id[MAX_REL_ID - 1] = '\0';
+        wb->sheets[wb->sheet_count].filename[0] = '\0';
+        wb->sheets[wb->sheet_count].output_name[0] = '\0';
         wb->sheets[wb->sheet_count].sheet_id = sheet_id;
-        
-        // Generate worksheet filename using sequential order (not sheetId)
-        // Excel file structure uses sheet1.xml, sheet2.xml, etc. in document order
-        snprintf(wb->sheets[wb->sheet_count].filename, MAX_SHEET_NAME,
-                "xl/worksheets/sheet%d.xml", wb->sheet_count + 1);
 
         wb->sheet_count++;
-        
-        free(name_attr);
-        if (sheet_id_attr) free(sheet_id_attr);
         pos++;
     }
 }
 
-// Convert Excel column reference to number (A=0, B=1, etc.)
-int col_ref_to_num(const char* ref) {
+void resolve_sheet_filenames(const char* xml_data, Workbook* wb) {
+    const char* pos = xml_data;
+    char id_attr[MAX_REL_ID];
+    char target_attr[MAX_SHEET_NAME];
+    char type_attr[128];
+
+    while ((pos = strstr(pos, "<Relationship ")) != NULL) {
+        if (FIND_ATTR_ID(pos, id_attr, sizeof(id_attr)) < 0 ||
+            FIND_ATTR_TARGET(pos, target_attr, sizeof(target_attr)) < 0 ||
+            FIND_ATTR_TYPE(pos, type_attr, sizeof(type_attr)) < 0) {
+            pos++;
+            continue;
+        }
+
+        if (!strstr(type_attr, "/worksheet")) {
+            pos++;
+            continue;
+        }
+
+        for (int i = 0; i < wb->sheet_count; i++) {
+            if (strcmp(wb->sheets[i].rel_id, id_attr) != 0) {
+                continue;
+            }
+
+            if (strncmp(target_attr, "/xl/", 4) == 0) {
+                strncpy(wb->sheets[i].filename, target_attr + 1, MAX_SHEET_NAME - 1);
+                wb->sheets[i].filename[MAX_SHEET_NAME - 1] = '\0';
+            } else if (strncmp(target_attr, "xl/", 3) == 0) {
+                strncpy(wb->sheets[i].filename, target_attr, MAX_SHEET_NAME - 1);
+                wb->sheets[i].filename[MAX_SHEET_NAME - 1] = '\0';
+            } else {
+                snprintf(wb->sheets[i].filename, MAX_SHEET_NAME, "xl/%s", target_attr);
+            }
+            break;
+        }
+
+        pos++;
+    }
+}
+
+// Excel 열 참조를 숫자로 변환 (A=0, B=1, 등)
+static inline int col_ref_to_num(const char* ref) {
     int col = 0;
     for (int i = 0; ref[i] && isalpha(ref[i]); i++) {
         col = col * 26 + (toupper(ref[i]) - 'A' + 1);
@@ -250,20 +1385,186 @@ int col_ref_to_num(const char* ref) {
     return col - 1;
 }
 
-// Extract row number from cell reference
-int extract_row_num(const char* ref) {
+// 셀 참조에서 행 번호 추출
+static inline int extract_row_num(const char* ref) {
     while (*ref && isalpha(*ref)) ref++;
     return atoi(ref) - 1;
 }
 
-// Escape TSV special characters
+static void parse_hidden_columns_xml(const char* xml_data, HiddenColumns* hidden_columns) {
+    const char* xml_end = xml_data + strlen(xml_data);
+    const char* pos = xml_data;
+    char tag_buffer[256];
+    char min_attr[32];
+    char max_attr[32];
+    char hidden_attr[16];
+
+    while ((pos = find_next_start_tag_local(pos, xml_end, "col")) != NULL) {
+        const char* tag_end = find_tag_end_in_range(pos, xml_end);
+        if (!tag_end) {
+            break;
+        }
+
+        copy_tag_range(pos, tag_end, tag_buffer, sizeof(tag_buffer));
+        if (FIND_ATTR_HIDDEN(tag_buffer, hidden_attr, sizeof(hidden_attr)) >= 0 &&
+            attr_is_true(hidden_attr) &&
+            FIND_ATTR_MIN(tag_buffer, min_attr, sizeof(min_attr)) >= 0 &&
+            FIND_ATTR_MAX(tag_buffer, max_attr, sizeof(max_attr)) >= 0) {
+            add_hidden_column_range(hidden_columns, atoi(min_attr) - 1, atoi(max_attr) - 1);
+        }
+
+        pos = tag_end + 1;
+    }
+}
+
+static bool parse_cell_ref(const char* ref, int* row, int* col) {
+    if (!ref || !isalpha((unsigned char)ref[0])) {
+        return false;
+    }
+
+    *col = col_ref_to_num(ref);
+    *row = extract_row_num(ref);
+    return *row >= 0 && *col >= 0;
+}
+
+static void parse_merge_regions_xml(const char* xml_data, MergeRegions* merge_regions) {
+    const char* xml_end = xml_data + strlen(xml_data);
+    const char* pos = xml_data;
+    char tag_buffer[256];
+    char ref_attr[64];
+
+    while ((pos = find_next_start_tag_local(pos, xml_end, "mergeCell")) != NULL) {
+        const char* tag_end = find_tag_end_in_range(pos, xml_end);
+        if (!tag_end) {
+            break;
+        }
+
+        copy_tag_range(pos, tag_end, tag_buffer, sizeof(tag_buffer));
+        if (FIND_ATTR_REF(tag_buffer, ref_attr, sizeof(ref_attr)) >= 0) {
+            char start_ref[32];
+            char end_ref[32];
+            const char* separator = strchr(ref_attr, ':');
+            int start_row;
+            int start_col;
+            int end_row;
+            int end_col;
+
+            if (separator) {
+                size_t start_len = (size_t)(separator - ref_attr);
+                if (start_len >= sizeof(start_ref)) {
+                    start_len = sizeof(start_ref) - 1;
+                }
+                memcpy(start_ref, ref_attr, start_len);
+                start_ref[start_len] = '\0';
+                strncpy(end_ref, separator + 1, sizeof(end_ref) - 1);
+                end_ref[sizeof(end_ref) - 1] = '\0';
+            } else {
+                strncpy(start_ref, ref_attr, sizeof(start_ref) - 1);
+                start_ref[sizeof(start_ref) - 1] = '\0';
+                strncpy(end_ref, ref_attr, sizeof(end_ref) - 1);
+                end_ref[sizeof(end_ref) - 1] = '\0';
+            }
+
+            if (parse_cell_ref(start_ref, &start_row, &start_col) &&
+                parse_cell_ref(end_ref, &end_row, &end_col)) {
+                add_merge_region(merge_regions, start_row, end_row, start_col, end_col);
+            }
+        }
+
+        pos = tag_end + 1;
+    }
+}
+
+static void register_merge_anchor_value(MergeRegions* merge_regions, int row, int col, const char* value) {
+    for (int i = 0; i < merge_regions->count; i++) {
+        MergeRegion* region = &merge_regions->regions[i];
+        if (region->start_row == row && region->start_col == col) {
+            strncpy(region->value, value, sizeof(region->value) - 1);
+            region->value[sizeof(region->value) - 1] = '\0';
+            region->value_set = true;
+        }
+    }
+}
+
+static void apply_merge_regions_to_row(MergeRegions* merge_regions, int row, RowBuffer* row_buffer) {
+    for (int i = 0; i < merge_regions->count; i++) {
+        MergeRegion* region = &merge_regions->regions[i];
+        if (!region->value_set || row < region->start_row || row > region->end_row) {
+            continue;
+        }
+
+        for (int col = region->start_col; col <= region->end_col; col++) {
+            add_row_cell_if_missing(row_buffer, col, region->value);
+        }
+    }
+}
+
+static bool row_buffer_has_visible_cells(const RowBuffer* row_buffer, const HiddenColumns* hidden_columns) {
+    for (int i = 0; i < row_buffer->count; i++) {
+        if (!is_hidden_column(hidden_columns, row_buffer->cells[i].col)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void emit_row_buffer(RowBuffer* row_buffer, const HiddenColumns* hidden_columns, Filter* output) {
+    sort_row_buffer(row_buffer);
+
+    int last_col = -1;
+    for (int i = 0; i < row_buffer->count; i++) {
+        int col = row_buffer->cells[i].col;
+        if (is_hidden_column(hidden_columns, col)) {
+            continue;
+        }
+
+        for (int gap_col = last_col + 1; gap_col < col; gap_col++) {
+            if (!is_hidden_column(hidden_columns, gap_col)) {
+                filter_push(output, "");
+            }
+        }
+
+        filter_push(output, row_buffer->cells[i].value);
+        last_col = col;
+    }
+
+    if (last_col >= 0) {
+        filter_finish_line(output);
+    }
+}
+
+static int max_merge_row_with_values(const MergeRegions* merge_regions) {
+    int max_row = -1;
+    for (int i = 0; i < merge_regions->count; i++) {
+        if (merge_regions->regions[i].value_set && merge_regions->regions[i].end_row > max_row) {
+            max_row = merge_regions->regions[i].end_row;
+        }
+    }
+    return max_row;
+}
+
+static void emit_synthetic_merge_rows(int first_row, int last_row,
+                                      const HiddenColumns* hidden_columns,
+                                      MergeRegions* merge_regions,
+                                      RowBuffer* row_buffer,
+                                      Filter* output) {
+    for (int row = first_row; row < last_row; row++) {
+        clear_row_buffer(row_buffer);
+        apply_merge_regions_to_row(merge_regions, row, row_buffer);
+        if (row_buffer_has_visible_cells(row_buffer, hidden_columns)) {
+            emit_row_buffer(row_buffer, hidden_columns, output);
+        }
+    }
+}
+
+// TSV 특수 문자 이스케이프
 void escape_tsv_value(const char* input, char* output, int max_len) {
     int i = 0, j = 0;
     while (input[i] && j < max_len - 1) {
         if (input[i] == '\t') {
-            output[j++] = ' ';  // Replace tab with space
+            output[j++] = ' ';  // 탭을 공백으로 치환
         } else if (input[i] == '\n' || input[i] == '\r') {
-            output[j++] = ' ';  // Replace newlines with space
+            output[j++] = ' ';  // 개행을 공백으로 치환
         } else {
             output[j++] = input[i];
         }
@@ -272,86 +1573,142 @@ void escape_tsv_value(const char* input, char* output, int max_len) {
     output[j] = '\0';
 }
 
-// Create safe filename from sheet name
-void create_safe_filename(const char* sheet_name, char* safe_name, int max_len) {
+// 시트 이름에서 안전한 파일명용 베이스 이름 생성
+void create_safe_filename_base(const char* sheet_name, char* safe_name, int max_len) {
     int i = 0, j = 0;
-    while (sheet_name[i] && j < max_len - 5) { // Reserve space for .tsv
+    while (sheet_name[i] && j < max_len - 1) {
         char c = sheet_name[i];
-        // Replace unsafe characters with underscore
-        if (c == '/' || c == '\\' || c == ':' || 
+        // 안전하지 않은 문자를 언더스코어로 치환
+        if (c == '/' || c == '\\' || c == ':' ||
             c == '?' || c == '"' || c == '<' || c == '>' || c == '|') {
             safe_name[j++] = '_';
         } else if (c == ' ') {
-            safe_name[j++] = '_';  // Replace spaces with underscores
+            safe_name[j++] = '_';  // 공백을 언더스코어로 치환
         } else if (c == '*') {
-            // Skip asterisk characters (don't add to filename)
-            // Do nothing, just move to next character
+            // 별표 문자 건너뛰기 (파일명에 추가하지 않음)
+            // 아무것도 하지 않고 다음 문자로 이동
         } else {
             safe_name[j++] = c;
         }
         i++;
     }
-    // Add .tsv extension
-    strcpy(safe_name + j, ".tsv");
+    if (j == 0) {
+        strncpy(safe_name, "sheet", max_len - 1);
+        safe_name[max_len - 1] = '\0';
+        return;
+    }
+    safe_name[j] = '\0';
 }
 
-// High-performance worksheet parser
+// 시트 이름에서 안전한 파일명 생성
+void create_safe_filename(const char* sheet_name, const char* extension, char* safe_name, int max_len) {
+    char base_name[MAX_OUTPUT_FILENAME];
+    create_safe_filename_base(sheet_name, base_name, sizeof(base_name));
+    snprintf(safe_name, max_len, "%s.%s", base_name, extension);
+}
+
+void create_unique_output_filename(const char* sheet_name, int sheet_index,
+                                   char used_names[][MAX_OUTPUT_FILENAME], int used_count,
+                                   const char* extension, char* output_filename, int max_len) {
+    char base_name[MAX_OUTPUT_FILENAME];
+    create_safe_filename_base(sheet_name, base_name, sizeof(base_name));
+
+    if (base_name[0] == '\0') {
+        snprintf(base_name, sizeof(base_name), "sheet%d", sheet_index + 1);
+    }
+
+    snprintf(output_filename, max_len, "%s.%s", base_name, extension);
+
+    bool is_duplicate = false;
+    for (int i = 0; i < used_count; i++) {
+        if (strcmp(used_names[i], output_filename) == 0) {
+            is_duplicate = true;
+            break;
+        }
+    }
+
+    if (!is_duplicate) {
+        return;
+    }
+
+    for (int suffix = 2; ; suffix++) {
+        snprintf(output_filename, max_len, "%s__%d.%s", base_name, suffix, extension);
+
+        is_duplicate = false;
+        for (int i = 0; i < used_count; i++) {
+            if (strcmp(used_names[i], output_filename) == 0) {
+                is_duplicate = true;
+                break;
+            }
+        }
+
+        if (!is_duplicate) {
+            return;
+        }
+    }
+}
+
+// 고성능 워크시트 파서
 void parse_worksheet(const char* xml_data, SharedStrings* ss, int start_row, Filter* output) {
     const char* pos = xml_data;
     int last_row = -1;
     int last_col = -1;
-    
+
+    // 반복 할당을 피하기 위한 재사용 가능한 버퍼
+    char cell_buffer[MAX_CELL_VALUE * 2];
+    char r_attr[32];
+    char t_attr[32];
+
     while ((pos = strstr(pos, "<c ")) != NULL) {
-        // Find the end of this cell tag to limit our search scope
+        // 검색 범위를 제한하기 위해 이 셀 태그의 끝 찾기
         const char* cell_end = NULL;
         size_t cell_length = 0;
-        
-        // Check if it's a self-closing tag
+
+        // 자기 닫힘 태그인지 확인
         const char* tag_close = strchr(pos, '>');
         if (!tag_close) {
             pos++;
             continue;
         }
-        
+
         if (*(tag_close - 1) == '/') {
-            // Self-closing tag: <c ... />
+            // 자기 닫힘 태그: <c ... />
             cell_end = tag_close + 1;
             cell_length = cell_end - pos;
         } else {
-            // Regular tag: <c ...>...</c>
+            // 일반 태그: <c ...>...</c>
             cell_end = strstr(pos, "</c>");
             if (!cell_end) {
                 pos++;
                 continue;
             }
             cell_length = cell_end - pos;
-            cell_end += 4; // Move past </c>
+            cell_end += 4; // </c>를 지나서 이동
         }
-        
-        // Extract cell reference (search within this cell only)
-        char* cell_content = malloc(cell_length + 1);
-        strncpy(cell_content, pos, cell_length);
-        cell_content[cell_length] = '\0';
-        
-        char* r_attr = find_attribute(cell_content, "r=");
-        if (!r_attr) {
-            free(cell_content);
+
+        // 버퍼에 셀 내용 복사 (이 셀 내에서만 검색)
+        if (cell_length >= sizeof(cell_buffer)) {
+            cell_length = sizeof(cell_buffer) - 1;
+        }
+        memcpy(cell_buffer, pos, cell_length);
+        cell_buffer[cell_length] = '\0';
+
+        // 셀 참조 추출
+        if (FIND_ATTR_R(cell_buffer, r_attr, sizeof(r_attr)) < 0) {
             pos = cell_end;
             continue;
         }
-        
+
                 int row = extract_row_num(r_attr);
         int col = col_ref_to_num(r_attr);
 
-        // Skip rows before start_row
+        // start_row 이전의 행 건너뛰기
         if (row < start_row) {
-            free(cell_content);
-            free(r_attr);
             pos = cell_end;
             continue;
         }
-        
-        // If we moved to a new row, output newline and reset column tracking
+
+        // 새로운 행으로 이동한 경우, 개행을 출력하고 열 추적 재설정
         if (last_row != -1 && row != last_row) {
             filter_finish_line(output);
 #ifdef DEBUG
@@ -359,89 +1716,85 @@ void parse_worksheet(const char* xml_data, SharedStrings* ss, int start_row, Fil
 #endif
             last_col = -1;
         }
-        
-        // Fill empty columns with tabs (for columns between last_col and current col)
+
+        // 빈 열을 탭으로 채우기 (last_col과 현재 col 사이의 열들)
         int tabs_needed = col - last_col - 1;
-        if (last_col >= 0) tabs_needed++; // Add one more tab to separate from previous cell
-        
+
         for (int i = 0; i < tabs_needed; i++) {
             filter_push(output, "");
         }
-        
-        // Extract cell type from the same cell content
-        char* t_attr = NULL;
-        char* temp_t_attr = find_attribute(cell_content, "t=");
-        if (temp_t_attr) {
-            t_attr = malloc(strlen(temp_t_attr) + 1);
-            strcpy(t_attr, temp_t_attr);
-            free(temp_t_attr);
-        }
-        
+
+        // 동일한 셀 내용에서 셀 타입 추출
+        int has_t_attr = FIND_ATTR_T(cell_buffer, t_attr, sizeof(t_attr)) >= 0;
+
         char cell_value[MAX_CELL_VALUE] = "";
-        
-        // Find cell value - handle different cell value formats (search within cell_content only)
-        char* v_content = NULL;
-        
-        // Method 1: Look for <v> tag (for numeric values and shared string references)
-        char* v_start = strstr(cell_content, "<v>");
-        if (v_start) {
-            v_start += 3; // Skip <v>
-            char* v_end = strstr(v_start, "</v>");
-            if (v_end) {
+        char v_content[MAX_CELL_VALUE];
+        int has_v_content = 0;
+
+        // 셀 값 찾기 - 다양한 셀 값 형식 처리 (cell_buffer 내에서만 검색)
+        // 방법 1: <v> 태그 찾기 (숫자 값 및 공유 문자열 참조용)
+        const char* v_start = strstr(cell_buffer, "<v>");
+        if (v_start && v_start < cell_buffer + cell_length) {
+            v_start += 3; // <v> 건너뛰기
+            const char* v_end = strstr(v_start, "</v>");
+            if (v_end && v_end < cell_buffer + cell_length) {
                 int len = v_end - v_start;
-                v_content = malloc(len + 1);
-                strncpy(v_content, v_start, len);
+                if (len >= MAX_CELL_VALUE) len = MAX_CELL_VALUE - 1;
+                memcpy(v_content, v_start, len);
                 v_content[len] = '\0';
+                has_v_content = 1;
             }
         }
-        
-        // Method 2: Look for inline string <is><t> tag (for inline text)
-        if (!v_content) {
-            char* is_start = strstr(cell_content, "<is><t>");
-            if (is_start) {
-                is_start += 7; // Skip <is><t>
-                char* is_end = strstr(is_start, "</t></is>");
-                if (is_end) {
+
+        // 방법 2: 인라인 문자열 <is><t> 태그 찾기 (인라인 텍스트용)
+        if (!has_v_content) {
+            const char* is_start = strstr(cell_buffer, "<is><t>");
+            if (is_start && is_start < cell_buffer + cell_length) {
+                is_start += 7; // <is><t> 건너뛰기
+                const char* is_end = strstr(is_start, "</t></is>");
+                if (is_end && is_end < cell_buffer + cell_length) {
                     int len = is_end - is_start;
-                    v_content = malloc(len + 1);
-                    strncpy(v_content, is_start, len);
+                    if (len >= MAX_CELL_VALUE) len = MAX_CELL_VALUE - 1;
+                    memcpy(v_content, is_start, len);
                     v_content[len] = '\0';
+                    has_v_content = 1;
                 }
             }
         }
-        
-        // Method 3: Look for simple <t> tag (for some text values)
-        if (!v_content) {
-            char* t_start = strstr(cell_content, "<t>");
-            if (t_start) {
-                t_start += 3; // Skip <t>
-                char* t_end = strstr(t_start, "</t>");
-                if (t_end) {
+
+        // 방법 3: 단순 <t> 태그 찾기 (일부 텍스트 값용)
+        if (!has_v_content) {
+            const char* t_start = strstr(cell_buffer, "<t>");
+            if (t_start && t_start < cell_buffer + cell_length) {
+                t_start += 3; // <t> 건너뛰기
+                const char* t_end = strstr(t_start, "</t>");
+                if (t_end && t_end < cell_buffer + cell_length) {
                     int len = t_end - t_start;
-                    v_content = malloc(len + 1);
-                    strncpy(v_content, t_start, len);
+                    if (len >= MAX_CELL_VALUE) len = MAX_CELL_VALUE - 1;
+                    memcpy(v_content, t_start, len);
                     v_content[len] = '\0';
+                    has_v_content = 1;
                 }
             }
         }
-        
-        if (v_content) {
-            // Handle different cell types
-            if (t_attr && strcmp(t_attr, "s") == 0) {
-                // Shared string reference
+
+        if (has_v_content) {
+            // 다양한 셀 타입 처리
+            if (has_t_attr && strcmp(t_attr, "s") == 0) {
+                // 공유 문자열 참조
                 int str_index = atoi(v_content);
                 if (str_index >= 0 && str_index < ss->count) {
                     escape_tsv_value(ss->strings[str_index], cell_value, MAX_CELL_VALUE);
 #ifdef DEBUG
-                    printf("DEBUG: Cell %s [+%dtabs] '%s' : shared_string[%d] : '%s'\n", 
+                    printf("DEBUG: Cell %s [+%dtabs] '%s' : shared_string[%d] : '%s'\n",
                            r_attr, tabs_needed, v_content, str_index, cell_value);
 #endif
                 }
             } else {
-                // Numeric, inline string, or other value
+                // 숫자, 인라인 문자열 또는 기타 값
                 escape_tsv_value(v_content, cell_value, MAX_CELL_VALUE);
 #ifdef DEBUG
-                printf("DEBUG: Cell %s [+%dtabs] '%s' : direct_value : '%s'\n", 
+                printf("DEBUG: Cell %s [+%dtabs] '%s' : direct_value : '%s'\n",
                        r_attr, tabs_needed, v_content, cell_value);
 #endif
             }
@@ -450,29 +1803,220 @@ void parse_worksheet(const char* xml_data, SharedStrings* ss, int start_row, Fil
             printf("DEBUG: Cell %s [+%dtabs] : empty_cell : ''\n", r_attr, tabs_needed);
 #endif
         }
-        
-        // Output cell value
+
+        // 셀 값 출력
         filter_push(output, cell_value);
-        
+
         last_row = row;
         last_col = col;
-        
-        free(cell_content);
-        if (r_attr) free(r_attr);
-        if (t_attr) free(t_attr);
-        if (v_content) free(v_content);
-        
-        // Move to next cell
+
+        // 다음 셀로 이동
         pos = cell_end;
     }
-    
-    // Output final newline if we processed any rows
+
+    // 행을 처리한 경우 마지막 개행 출력
     if (last_row >= start_row) {
         filter_finish_line(output);
     }
 }
 
-// Free shared strings memory
+static void extract_generic_cell_value(const char* cell_open_tag,
+                                       const char* cell_content_start,
+                                       const char* cell_close,
+                                       bool self_closing,
+                                       SharedStrings* ss,
+                                       const Styles* styles,
+                                       bool formatted_output,
+                                       char* cell_value,
+                                       int max_len) {
+    char s_attr[32];
+    char t_attr[32];
+    char v_content[MAX_CELL_VALUE];
+    bool has_type_attr = FIND_ATTR_T(cell_open_tag, t_attr, sizeof(t_attr)) >= 0;
+    int style_index = -1;
+
+    if (FIND_ATTR_S(cell_open_tag, s_attr, sizeof(s_attr)) >= 0) {
+        style_index = atoi(s_attr);
+    }
+
+    v_content[0] = '\0';
+    cell_value[0] = '\0';
+
+    if (self_closing) {
+        return;
+    }
+
+    if (has_type_attr && strcmp(t_attr, "s") == 0) {
+        if (extract_first_tag_text(cell_content_start, cell_close, "v", v_content, sizeof(v_content))) {
+            int str_index = atoi(v_content);
+            if (str_index >= 0 && str_index < ss->count) {
+                escape_tsv_value(ss->strings[str_index], cell_value, max_len);
+            }
+        }
+        return;
+    }
+
+    if (has_type_attr && strcmp(t_attr, "inlineStr") == 0) {
+        if (extract_inline_string_text(cell_content_start, cell_close, v_content, sizeof(v_content))) {
+            escape_tsv_value(v_content, cell_value, max_len);
+        }
+        return;
+    }
+
+    if (extract_first_tag_text(cell_content_start, cell_close, "v", v_content, sizeof(v_content))) {
+        format_generic_scalar(v_content, has_type_attr, t_attr, style_index, styles,
+                              formatted_output, cell_value, max_len);
+        return;
+    }
+
+    if (extract_inline_string_text(cell_content_start, cell_close, v_content, sizeof(v_content))) {
+        escape_tsv_value(v_content, cell_value, max_len);
+    }
+}
+
+void parse_worksheet_generic(const char* xml_data, SharedStrings* ss, const Styles* styles,
+                             const HiddenColumns* hidden_columns, MergeRegions* merge_regions,
+                             int start_row, bool formatted_output, bool skip_hidden,
+                             Filter* output) {
+    const char* xml_end = xml_data + strlen(xml_data);
+    const char* pos = xml_data;
+    int last_parsed_row = -1;
+    int inferred_row = -1;
+    RowBuffer row_buffer;
+
+    init_row_buffer(&row_buffer);
+
+    while ((pos = find_next_start_tag_local(pos, xml_end, "row")) != NULL) {
+        const char* row_tag_end = find_tag_end_in_range(pos, xml_end);
+        const char* row_content_start;
+        const char* row_close;
+        const char* row_close_end;
+        bool self_closing_row;
+        char row_open_tag[256];
+        char row_attr[32];
+        char hidden_attr[16];
+        int row;
+        bool row_hidden = false;
+
+        if (!row_tag_end) {
+            break;
+        }
+
+        copy_tag_range(pos, row_tag_end, row_open_tag, sizeof(row_open_tag));
+        self_closing_row = is_self_closing_tag(pos, row_tag_end);
+        row_content_start = row_tag_end + 1;
+        row_close = self_closing_row ? NULL : find_next_end_tag_local(row_content_start, xml_end, "row");
+        if (!self_closing_row && !row_close) {
+            pos = row_tag_end + 1;
+            continue;
+        }
+
+        row_close_end = self_closing_row ? row_tag_end : find_tag_end_in_range(row_close, xml_end);
+        if (!row_close_end) {
+            break;
+        }
+
+        row = inferred_row + 1;
+        if (find_attribute(row_open_tag, "r=", 2, row_attr, sizeof(row_attr)) >= 0) {
+            row = atoi(row_attr) - 1;
+        }
+        inferred_row = row;
+
+        if (last_parsed_row >= 0) {
+            int synthetic_start = last_parsed_row + 1;
+            if (synthetic_start < start_row) {
+                synthetic_start = start_row;
+            }
+            if (synthetic_start < row) {
+                emit_synthetic_merge_rows(synthetic_start, row, hidden_columns, merge_regions,
+                                          &row_buffer, output);
+            }
+        }
+
+        clear_row_buffer(&row_buffer);
+
+        if (skip_hidden &&
+            FIND_ATTR_HIDDEN(row_open_tag, hidden_attr, sizeof(hidden_attr)) >= 0 &&
+            attr_is_true(hidden_attr)) {
+            row_hidden = true;
+        }
+
+        if (!self_closing_row) {
+            const char* cell_pos = row_content_start;
+
+            while ((cell_pos = find_next_start_tag_local(cell_pos, row_close, "c")) != NULL) {
+                const char* cell_tag_end = find_tag_end_in_range(cell_pos, row_close);
+                const char* cell_content_start;
+                const char* cell_close;
+                const char* cell_close_end;
+                bool self_closing_cell;
+                char cell_open_tag[512];
+                char r_attr[32];
+                char cell_value[MAX_CELL_VALUE];
+                int col;
+
+                if (!cell_tag_end) {
+                    break;
+                }
+
+                copy_tag_range(cell_pos, cell_tag_end, cell_open_tag, sizeof(cell_open_tag));
+                self_closing_cell = is_self_closing_tag(cell_pos, cell_tag_end);
+                cell_content_start = cell_tag_end + 1;
+                cell_close = self_closing_cell ? NULL : find_next_end_tag_local(cell_content_start, row_close, "c");
+                if (!self_closing_cell && !cell_close) {
+                    cell_pos = cell_tag_end + 1;
+                    continue;
+                }
+
+                if (FIND_ATTR_R(cell_open_tag, r_attr, sizeof(r_attr)) < 0) {
+                    cell_pos = self_closing_cell ? cell_tag_end + 1 : cell_close + 1;
+                    continue;
+                }
+
+                col = col_ref_to_num(r_attr);
+                extract_generic_cell_value(cell_open_tag, cell_content_start, cell_close, self_closing_cell,
+                                           ss, styles, formatted_output, cell_value, sizeof(cell_value));
+                add_row_cell(&row_buffer, col, cell_value);
+                register_merge_anchor_value(merge_regions, row, col, cell_value);
+
+                if (self_closing_cell) {
+                    cell_pos = cell_tag_end + 1;
+                } else {
+                    cell_close_end = find_tag_end_in_range(cell_close, row_close);
+                    if (!cell_close_end) {
+                        break;
+                    }
+                    cell_pos = cell_close_end + 1;
+                }
+            }
+        }
+
+        apply_merge_regions_to_row(merge_regions, row, &row_buffer);
+
+        if (row >= start_row && !row_hidden && row_buffer_has_visible_cells(&row_buffer, hidden_columns)) {
+            emit_row_buffer(&row_buffer, hidden_columns, output);
+        }
+
+        last_parsed_row = row;
+        pos = row_close_end + 1;
+    }
+
+    if (last_parsed_row >= 0) {
+        int trailing_start = last_parsed_row + 1;
+        int trailing_end = max_merge_row_with_values(merge_regions) + 1;
+        if (trailing_start < start_row) {
+            trailing_start = start_row;
+        }
+        if (trailing_start < trailing_end) {
+            emit_synthetic_merge_rows(trailing_start, trailing_end, hidden_columns, merge_regions,
+                                      &row_buffer, output);
+        }
+    }
+
+    free_row_buffer(&row_buffer);
+}
+
+// 공유 문자열 메모리 해제
 void free_shared_strings(SharedStrings* ss) {
     for (int i = 0; i < ss->count; i++) {
         free(ss->strings[i]);
@@ -484,8 +2028,16 @@ void free_shared_strings(SharedStrings* ss) {
 
 int main(int argc, char* argv[]) {
     if (argc < 2) {
-        printf("Usage: %s <input.xlsx> [start_row] [--no-wildcard]\n", argv[0]);
+        printf("Usage: %s <input.xlsx> [start_row] [--no-wildcard] [--all-sheets] [--formatted] [--expand-merged] [--skip-hidden] [--csv] [--jsonl]\n", argv[0]);
         printf("  start_row: 1-based row number to start conversion (default: 1)\n");
+        printf("             Rows before start_row are ignored\n");
+        printf("             Default mode uses the start_row row as the TSV header row\n");
+        printf("  --all-sheets: Export every worksheet and keep all columns without header filtering\n");
+        printf("  --formatted: Use styles.xml number formats for human-readable values in all-sheets mode\n");
+        printf("  --expand-merged: Fill merged cells with the top-left value in all-sheets mode\n");
+        printf("  --skip-hidden: Skip hidden rows and hidden columns in all-sheets mode\n");
+        printf("  --csv: Write generic output as CSV files instead of TSV\n");
+        printf("  --jsonl: Write generic output as JSONL files using the first emitted row as field names\n");
         printf("\n");
         printf("Wildcard (*) character behavior:\n");
         printf("  Default mode:\n");
@@ -495,88 +2047,233 @@ int main(int argc, char* argv[]) {
         printf("    - Sheets containing * will be skipped entirely\n");
         printf("    - Columns containing * will be excluded from output\n");
         printf("\n");
-        printf("Note: Only A-Z, a-z, 0-9, -, _, * characters are valid in sheet/column names\n");
-        printf("      Names with spaces, special characters, or non-ASCII will be skipped\n");
+        printf("Note: Default mode only exports sheets/headers matching the game DB naming rules\n");
+        printf("      --all-sheets disables sheet/header name filtering and only sanitizes output filenames\n");
+        printf("      --formatted implies --all-sheets and formats dates/times/numbers for LLM-friendly TSV output\n");
+        printf("      --expand-merged, --skip-hidden, --csv, and --jsonl also imply --all-sheets\n");
         return 1;
     }
     
     const char* input_file = argv[1];
-    int start_row = (argc > 2) ? atoi(argv[2]) - 1 : 0;  // Convert to 0-based
-    if (argc > 3 && strcmp(argv[3], "--no-wildcard") == 0) {
-        ALLOW_WILD_CARD = false;
+    int start_row = 0;
+    bool export_all_sheets = false;
+    bool formatted_output = false;
+    bool expand_merged_cells = false;
+    bool skip_hidden = false;
+    bool start_row_set = false;
+    OutputFormat output_format = OUTPUT_FORMAT_TSV;
+
+    for (int i = 2; i < argc; i++) {
+        if (strcmp(argv[i], "--no-wildcard") == 0) {
+            ALLOW_WILD_CARD = false;
+            continue;
+        }
+
+        if (strcmp(argv[i], "--all-sheets") == 0) {
+            export_all_sheets = true;
+            continue;
+        }
+
+        if (strcmp(argv[i], "--formatted") == 0) {
+            formatted_output = true;
+            export_all_sheets = true;
+            continue;
+        }
+
+        if (strcmp(argv[i], "--expand-merged") == 0) {
+            expand_merged_cells = true;
+            export_all_sheets = true;
+            continue;
+        }
+
+        if (strcmp(argv[i], "--skip-hidden") == 0) {
+            skip_hidden = true;
+            export_all_sheets = true;
+            continue;
+        }
+
+        if (strcmp(argv[i], "--csv") == 0) {
+            output_format = OUTPUT_FORMAT_CSV;
+            export_all_sheets = true;
+            continue;
+        }
+
+        if (strcmp(argv[i], "--jsonl") == 0) {
+            output_format = OUTPUT_FORMAT_JSONL;
+            export_all_sheets = true;
+            continue;
+        }
+
+        char* end_ptr = NULL;
+        long parsed_row = strtol(argv[i], &end_ptr, 10);
+        if (!start_row_set && argv[i][0] != '\0' && end_ptr && *end_ptr == '\0') {
+            start_row = (int)parsed_row - 1;
+            start_row_set = true;
+            continue;
+        }
+
+        printf("Error: Unknown argument: %s\n", argv[i]);
+        return 1;
     }
+
     if (start_row < 0) start_row = 0;
-    
+
     printf("Converting XLSX to multiple TSV files...\n");
     printf("Input: %s\n", input_file);
     printf("Starting from row: %d\n", start_row + 1);
-    
+    if (export_all_sheets) {
+        printf("Mode: all sheets\n");
+        if (formatted_output) {
+            printf("Formatting: enabled\n");
+        }
+        if (expand_merged_cells) {
+            printf("Merged cells: expanded\n");
+        }
+        if (skip_hidden) {
+            printf("Hidden rows/columns: skipped\n");
+        }
+        if (output_format == OUTPUT_FORMAT_CSV) {
+            printf("Output format: csv\n");
+        } else if (output_format == OUTPUT_FORMAT_JSONL) {
+            printf("Output format: jsonl\n");
+        }
+    }
+
     clock_t start_time = clock();
-    
-    // Open XLSX file
+
+    Styles styles;
+    init_styles(&styles);
+    styles.enabled = formatted_output;
+
+    // XLSX 파일 열기
     mz_zip_archive zip;
     if (!mz_zip_reader_init_file(&zip, input_file)) {
         printf("Error: Could not open XLSX file: %s\n", input_file);
+        free_styles(&styles);
         return 1;
     }
-    
-    // Initialize workbook and parse sheet information
+
+    // 워크북 초기화 및 시트 정보 파싱
     Workbook workbook;
     int workbook_index;
     if (!mz_zip_reader_locate_file(&zip, "xl/workbook.xml", &workbook_index)) {
         printf("Error: Could not find workbook.xml in XLSX file\n");
         mz_zip_reader_end(&zip);
+        free_styles(&styles);
         return 1;
     }
-    
+
     size_t workbook_size = mz_zip_reader_get_file_size(&zip, workbook_index);
     char* workbook_data = malloc(workbook_size + 1);
-    
+
     if (!mz_zip_reader_extract_to_mem(&zip, workbook_index, workbook_data, workbook_size)) {
         printf("Error: Could not extract workbook.xml\n");
         free(workbook_data);
         mz_zip_reader_end(&zip);
+        free_styles(&styles);
         return 1;
     }
     
     workbook_data[workbook_size] = '\0';
-    parse_workbook(workbook_data, &workbook);
+    styles.date_1904 = workbook_uses_1904_date_system(workbook_data);
+    parse_workbook(workbook_data, &workbook, export_all_sheets);
     free(workbook_data);
-    
-    if (workbook.sheet_count == 0) {
-        printf("No valid sheets found (sheets must contain only A-Z, a-z, 0-9, -, _, *)\n");
+
+    int workbook_rels_index;
+    if (!mz_zip_reader_locate_file(&zip, "xl/_rels/workbook.xml.rels", &workbook_rels_index)) {
+        printf("Error: Could not find workbook.xml.rels in XLSX file\n");
         mz_zip_reader_end(&zip);
+        free_styles(&styles);
         return 1;
     }
-    
+
+    size_t workbook_rels_size = mz_zip_reader_get_file_size(&zip, workbook_rels_index);
+    char* workbook_rels_data = malloc(workbook_rels_size + 1);
+
+    if (!mz_zip_reader_extract_to_mem(&zip, workbook_rels_index, workbook_rels_data, workbook_rels_size)) {
+        printf("Error: Could not extract workbook.xml.rels\n");
+        free(workbook_rels_data);
+        mz_zip_reader_end(&zip);
+        free_styles(&styles);
+        return 1;
+    }
+
+    workbook_rels_data[workbook_rels_size] = '\0';
+    resolve_sheet_filenames(workbook_rels_data, &workbook);
+    free(workbook_rels_data);
+
+    if (workbook.sheet_count == 0) {
+        if (export_all_sheets) {
+            printf("No sheets found in workbook\n");
+        } else {
+            printf("No valid sheets found (sheets must contain only A-Z, a-z, 0-9, -, _, *)\n");
+        }
+        mz_zip_reader_end(&zip);
+        free_styles(&styles);
+        return 1;
+    }
+
     printf("Found %d sheet(s) to process\n\n", workbook.sheet_count);
-    
-    // Initialize shared strings
+
+    // 공유 문자열 초기화
     SharedStrings shared_strings;
     init_shared_strings(&shared_strings);
-    
-    // Extract and parse shared strings
+
+    // 공유 문자열 추출 및 파싱
     int shared_strings_index;
     if (mz_zip_reader_locate_file(&zip, "xl/sharedStrings.xml", &shared_strings_index)) {
         printf("Loading shared strings...\n");
         size_t shared_strings_size = mz_zip_reader_get_file_size(&zip, shared_strings_index);
         char* shared_strings_data = malloc(shared_strings_size + 1);
-        
+
         if (mz_zip_reader_extract_to_mem(&zip, shared_strings_index, shared_strings_data, shared_strings_size)) {
             shared_strings_data[shared_strings_size] = '\0';
-            parse_shared_strings(shared_strings_data, &shared_strings);
+            if (export_all_sheets) {
+                parse_shared_strings_generic(shared_strings_data, &shared_strings);
+            } else {
+                parse_shared_strings(shared_strings_data, &shared_strings);
+            }
             printf("Loaded %d shared strings\n\n", shared_strings.count);
         }
-        
+
         free(shared_strings_data);
     }
-    
-    // Process each sheet
+
+    if (formatted_output) {
+        int styles_index;
+        if (mz_zip_reader_locate_file(&zip, "xl/styles.xml", &styles_index)) {
+            size_t styles_size = mz_zip_reader_get_file_size(&zip, styles_index);
+            char* styles_data = malloc(styles_size + 1);
+
+            if (mz_zip_reader_extract_to_mem(&zip, styles_index, styles_data, styles_size)) {
+                styles_data[styles_size] = '\0';
+                parse_styles_xml(styles_data, &styles);
+            }
+
+            free(styles_data);
+        }
+    }
+
+    // 각 시트 처리
     int processed_sheets = 0;
+    char used_output_names[MAX_SHEETS][MAX_OUTPUT_FILENAME];
+    int used_output_count = 0;
+    const char* output_extension = "tsv";
+    if (output_format == OUTPUT_FORMAT_CSV) {
+        output_extension = "csv";
+    } else if (output_format == OUTPUT_FORMAT_JSONL) {
+        output_extension = "jsonl";
+    }
+
     for (int i = 0; i < workbook.sheet_count; i++) {
         printf("Processing sheet %d/%d: '%s'\n", i + 1, workbook.sheet_count, workbook.sheets[i].name);
-        
-        // Extract and parse worksheet
+
+        if (workbook.sheets[i].filename[0] == '\0') {
+            printf("Warning: Could not resolve worksheet file for sheet: %s - skipping\n\n", workbook.sheets[i].name);
+            continue;
+        }
+
+        // 워크시트 추출 및 파싱
         int worksheet_index;
         if (!mz_zip_reader_locate_file(&zip, workbook.sheets[i].filename, &worksheet_index)) {
             printf("Warning: Could not find worksheet file: %s - skipping\n\n", workbook.sheets[i].filename);
@@ -593,33 +2290,67 @@ int main(int argc, char* argv[]) {
         }
         
         worksheet_data[worksheet_size] = '\0';
-        
-        // Create safe output filename
-        char output_filename[MAX_SHEET_NAME + 10];
-        create_safe_filename(workbook.sheets[i].name, output_filename, sizeof(output_filename));
-        
-        // Open output file
-        Filter* output = filter_init(output_filename);
+
+        HiddenColumns hidden_columns;
+        MergeRegions merge_regions;
+        init_hidden_columns(&hidden_columns);
+        init_merge_regions(&merge_regions);
+
+        if (export_all_sheets) {
+            if (skip_hidden) {
+                parse_hidden_columns_xml(worksheet_data, &hidden_columns);
+            }
+            if (expand_merged_cells) {
+                parse_merge_regions_xml(worksheet_data, &merge_regions);
+            }
+        }
+
+        // 안전한 출력 파일명 생성
+        char output_filename[MAX_OUTPUT_FILENAME];
+        create_unique_output_filename(workbook.sheets[i].name, i, used_output_names, used_output_count,
+                                      output_extension, output_filename, sizeof(output_filename));
+
+        // 출력 파일 열기
+        Filter* output = filter_init(output_filename,
+                                     export_all_sheets ? FILTER_MODE_RAW : FILTER_MODE_GAME_DB,
+                                     output_format);
         if (!output) {
             printf("Warning: Could not create output file: %s - skipping\n\n", output_filename);
+            free_hidden_columns(&hidden_columns);
+            free_merge_regions(&merge_regions);
             free(worksheet_data);
             continue;
         }
-        
+
+        strncpy(workbook.sheets[i].output_name, output_filename, MAX_OUTPUT_FILENAME - 1);
+        workbook.sheets[i].output_name[MAX_OUTPUT_FILENAME - 1] = '\0';
+        strncpy(used_output_names[used_output_count], output_filename, MAX_OUTPUT_FILENAME - 1);
+        used_output_names[used_output_count][MAX_OUTPUT_FILENAME - 1] = '\0';
+        used_output_count++;
+
         printf("  Output file: %s\n", output_filename);
-        
-        // Parse worksheet and generate TSV
-        parse_worksheet(worksheet_data, &shared_strings, start_row, output);
-        
-        // Cleanup for this sheet
+
+        // 워크시트 파싱 및 TSV 생성
+        if (export_all_sheets) {
+            parse_worksheet_generic(worksheet_data, &shared_strings, &styles,
+                                    &hidden_columns, &merge_regions, start_row,
+                                    formatted_output, skip_hidden, output);
+        } else {
+            parse_worksheet(worksheet_data, &shared_strings, start_row, output);
+        }
+
+        // 이 시트에 대한 정리
         filter_close(output);
+        free_hidden_columns(&hidden_columns);
+        free_merge_regions(&merge_regions);
         free(worksheet_data);
         processed_sheets++;
-        
+
         printf("  Sheet '%s' processed successfully!\n\n", workbook.sheets[i].name);
     }
     mz_zip_reader_end(&zip);
     free_shared_strings(&shared_strings);
+    free_styles(&styles);
     
     clock_t end_time = clock();
     double elapsed = ((double)(end_time - start_time)) / CLOCKS_PER_SEC;
@@ -632,15 +2363,13 @@ int main(int argc, char* argv[]) {
         printf("Conversion completed successfully!\n");
         printf("Output files created:\n");
         for (int i = 0; i < workbook.sheet_count; i++) {
-            char output_filename[MAX_SHEET_NAME + 10];
-            create_safe_filename(workbook.sheets[i].name, output_filename, sizeof(output_filename));
-            printf("  - %s (from sheet: %s)\n", output_filename, workbook.sheets[i].name);
+            if (workbook.sheets[i].output_name[0] != '\0') {
+                printf("  - %s (from sheet: %s)\n", workbook.sheets[i].output_name, workbook.sheets[i].name);
+            }
         }
         return 0;
     } else {
         printf("No sheets were processed successfully.\n");
         return 1;
     }
-} 
-
-// *** xlsx_to_tsv END
+}

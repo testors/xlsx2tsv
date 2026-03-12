@@ -97,7 +97,7 @@ static void capture_json_headers(Filter* filter) {
     filter->json_header_count = filter->raw_field_count;
 }
 
-Filter* filter_init(const char* filename, FilterMode mode, OutputFormat output_format) {
+static Filter* filter_init_common(FilterMode mode, OutputFormat output_format) {
     Filter* filter = (Filter*)malloc(sizeof(Filter));
     if (!filter) {
         return NULL;
@@ -105,9 +105,18 @@ Filter* filter_init(const char* filename, FilterMode mode, OutputFormat output_f
 
     filter->mode = mode;
     filter->output_format = output_format;
+    filter->owns_fp = false;
     filter->col_count = 0;
     filter->row_count = 0;
     filter->valid_col_count = 0;
+    filter->max_emitted_cols = 0;
+    filter->max_rows = 0;
+    filter->stop_requested = false;
+    filter->truncated = false;
+    filter->output_limit_hit = false;
+    filter->bytes_written = 0;
+    filter->max_output_bytes = 0;
+    filter->shared_output_bytes = NULL;
     filter->buffer_pos = 0;
     filter->raw_fields = NULL;
     filter->raw_field_count = 0;
@@ -122,12 +131,33 @@ Filter* filter_init(const char* filename, FilterMode mode, OutputFormat output_f
         filter->headers[i].is_valid = 0;
     }
 
+    return filter;
+}
+
+Filter* filter_init_stream(FILE* fp, FilterMode mode, OutputFormat output_format) {
+    Filter* filter = filter_init_common(mode, output_format);
+    if (!filter) {
+        return NULL;
+    }
+
+    filter->fp = fp;
+    filter->owns_fp = false;
+    return filter;
+}
+
+Filter* filter_init(const char* filename, FilterMode mode, OutputFormat output_format) {
+    Filter* filter = filter_init_common(mode, output_format);
+    if (!filter) {
+        return NULL;
+    }
+
     filter->fp = fopen(filename, "w");
     if (!filter->fp) {
         free(filter);
         return NULL;
     }
 
+    filter->owns_fp = true;
     return filter;
 }
 
@@ -153,7 +183,9 @@ void filter_close(Filter* filter) {
         filter->buffer_pos = 0;
     }
 
-    fclose(filter->fp);
+    if (filter->owns_fp) {
+        fclose(filter->fp);
+    }
     // 헤더 이름들 해제
     for (int i = 0; i < MAX_COLUMNS; i++) {
         if (filter->headers[i].name) {
@@ -176,8 +208,33 @@ void remove_wildcards(const char* input, char* output, int max_len) {
     output[j] = '\0';
 }
 
+static bool reserve_output_bytes(Filter* filter, size_t len) {
+    size_t current_total = filter->shared_output_bytes ? *filter->shared_output_bytes : filter->bytes_written;
+
+    if (filter->max_output_bytes > 0 && current_total + len > filter->max_output_bytes) {
+        filter->truncated = true;
+        filter->stop_requested = true;
+        filter->output_limit_hit = true;
+        return false;
+    }
+
+    filter->bytes_written += len;
+    if (filter->shared_output_bytes) {
+        *filter->shared_output_bytes += len;
+    }
+    return true;
+}
+
 // 버퍼에 문자열을 추가하는 헬퍼 함수
 static inline void append_to_buffer(Filter* filter, const char* str, int len) {
+    if (filter->stop_requested || len <= 0) {
+        return;
+    }
+
+    if (!reserve_output_bytes(filter, (size_t)len)) {
+        return;
+    }
+
     // 버퍼가 넘칠 경우 먼저 플러시
     if (filter->buffer_pos + len >= LINE_BUFFER_SIZE) {
         fwrite(filter->line_buffer, 1, filter->buffer_pos, filter->fp);
@@ -260,10 +317,14 @@ static void append_json_string(Filter* filter, const char* data) {
 }
 
 static inline void filter_push_raw(Filter* filter, const char* data) {
+    if (filter->stop_requested) {
+        return;
+    }
+
     ensure_raw_field_capacity(filter, filter->raw_field_count + 1);
     filter->raw_fields[filter->raw_field_count] = strdup(data);
     if (!filter->raw_fields[filter->raw_field_count]) {
-        printf("Error: Memory allocation failed\n");
+        fprintf(stderr, "Error: Memory allocation failed\n");
         exit(1);
     }
     filter->raw_field_count++;
@@ -271,7 +332,7 @@ static inline void filter_push_raw(Filter* filter, const char* data) {
 }
 
 void filter_push(Filter* filter, const char* data) {
-    if (!filter || !data) {
+    if (!filter || !data || filter->stop_requested) {
         return;
     }
 
@@ -281,14 +342,14 @@ void filter_push(Filter* filter, const char* data) {
     }
 
     if (filter->col_count >= MAX_COLUMNS) {
-        printf("Error: Too many columns\n");
+        fprintf(stderr, "Error: Too many columns\n");
         exit(1);
     }
 
     if (filter->row_count == 0) {
         filter->headers[filter->col_count].name = strdup(data);
         if (!filter->headers[filter->col_count].name) {
-            printf("Error: Memory allocation failed\n");
+            fprintf(stderr, "Error: Memory allocation failed\n");
             exit(1);
         }
         filter->headers[filter->col_count].is_valid = is_valid_name(data);
@@ -317,7 +378,18 @@ void filter_push(Filter* filter, const char* data) {
 }
 
 void filter_finish_line(Filter* filter) {
+    int emitted_cols;
+
+    if (filter->stop_requested && filter->col_count == 0 && filter->raw_field_count == 0) {
+        return;
+    }
+
     if (filter->mode == FILTER_MODE_RAW) {
+        emitted_cols = filter->raw_field_count;
+        if (emitted_cols > filter->max_emitted_cols) {
+            filter->max_emitted_cols = emitted_cols;
+        }
+
         if (filter->output_format == OUTPUT_FORMAT_JSONL) {
             if (filter->row_count == 0) {
                 capture_json_headers(filter);
@@ -364,11 +436,54 @@ void filter_finish_line(Filter* filter) {
         filter->row_count++;
         filter->col_count = 0;
         filter->valid_col_count = 0;
+        if (filter->max_rows > 0 && filter->row_count >= filter->max_rows) {
+            filter->truncated = true;
+            filter->stop_requested = true;
+        }
         return;
+    }
+
+    emitted_cols = filter->valid_col_count;
+    if (emitted_cols > filter->max_emitted_cols) {
+        filter->max_emitted_cols = emitted_cols;
     }
 
     append_to_buffer(filter, "\n", 1);
     filter->row_count++;
     filter->col_count = 0;
     filter->valid_col_count = 0;
+    if (filter->max_rows > 0 && filter->row_count >= filter->max_rows) {
+        filter->truncated = true;
+        filter->stop_requested = true;
+    }
+}
+
+void filter_set_limits(Filter* filter, int max_rows, size_t max_output_bytes, size_t* shared_output_bytes) {
+    filter->max_rows = max_rows;
+    filter->max_output_bytes = max_output_bytes;
+    filter->shared_output_bytes = shared_output_bytes;
+}
+
+bool filter_should_stop(const Filter* filter) {
+    return filter && filter->stop_requested;
+}
+
+bool filter_was_truncated(const Filter* filter) {
+    return filter && filter->truncated;
+}
+
+bool filter_hit_output_limit(const Filter* filter) {
+    return filter && filter->output_limit_hit;
+}
+
+int filter_row_count(const Filter* filter) {
+    return filter ? filter->row_count : 0;
+}
+
+int filter_max_cols(const Filter* filter) {
+    return filter ? filter->max_emitted_cols : 0;
+}
+
+size_t filter_bytes_written(const Filter* filter) {
+    return filter ? filter->bytes_written : 0;
 }

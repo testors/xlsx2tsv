@@ -16,7 +16,7 @@ clean:
 
 test: $(TARGET)
 	@echo "Build completed successfully!"
-	@echo "Usage: ./$(TARGET) input.xlsx [start_row] [--mode generic|game-db-fast] [--output-dir dir] [--no-wildcard] [--formatted] [--expand-merged] [--skip-hidden] [--csv] [--jsonl]"
+	@echo "Usage: ./$(TARGET) input.xlsx [start_row] [--mode generic|game-db-fast] [--output-dir dir] [--sheet name] [--sheet-regex pattern] [--list-sheets] [--json] [--manifest-json path] [--manifest-stdout] [--stdout] [--max-sheets n] [--max-rows-per-sheet n] [--max-output-bytes n] [--fail-if-truncated] [--fail-if-no-sheet] [--fail-on-output-collision] [--no-wildcard] [--formatted] [--expand-merged] [--skip-hidden] [--csv] [--jsonl]"
 
 install: $(TARGET)
 	cp $(TARGET) /usr/local/bin/

@@ -5,6 +5,7 @@
 #include <time.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <regex.h>
 #include <sys/stat.h>
 
 #include "miniz.h"
@@ -16,6 +17,20 @@
 #define MAX_REL_ID 64
 #define MAX_OUTPUT_FILENAME (MAX_SHEET_NAME + 32)
 #define MAX_OUTPUT_PATH 4096
+#define MAX_SHEET_STATE 16
+#define MAX_WARNING_CODE 64
+#define MAX_WARNING_MESSAGE 256
+#define MAX_SHEET_WARNINGS 16
+#define MAX_SHEET_FILTERS 128
+#define TOOL_VERSION "0.1.0"
+
+static FILE* g_log_fp = NULL;
+#define printf(...) fprintf(g_log_fp ? g_log_fp : stdout, __VA_ARGS__)
+
+typedef struct {
+    char code[MAX_WARNING_CODE];
+    char message[MAX_WARNING_MESSAGE];
+} SheetWarning;
 
 // 성능을 위한 공유 문자열 구조체
 typedef struct {
@@ -30,7 +45,18 @@ typedef struct {
     char rel_id[MAX_REL_ID];
     char filename[MAX_SHEET_NAME];
     char output_name[MAX_OUTPUT_PATH];
+    char state[MAX_SHEET_STATE];
     int sheet_id;
+    bool hidden;
+    bool selected;
+    bool processed;
+    bool truncated;
+    int emitted_rows;
+    int emitted_cols;
+    int approx_rows;
+    int approx_cols;
+    SheetWarning warnings[MAX_SHEET_WARNINGS];
+    int warning_count;
 } SheetInfo;
 
 // 워크북 구조체
@@ -115,6 +141,30 @@ typedef struct {
     int capacity;
 } RowBuffer;
 
+typedef struct {
+    bool list_sheets;
+    bool json;
+    bool manifest_stdout;
+    const char* manifest_json_path;
+    bool stdout_output;
+    bool fail_if_no_sheet;
+    bool fail_on_output_collision;
+    int max_sheets;
+    int max_rows_per_sheet;
+    size_t max_output_bytes;
+    bool fail_if_truncated;
+    const char* output_dir;
+    OutputFormat output_format;
+    int start_row;
+    bool game_db_fast_mode;
+} RunOptions;
+
+typedef struct {
+    char messages[MAX_SHEET_WARNINGS][MAX_WARNING_MESSAGE];
+    int count;
+    bool truncated;
+} GlobalWarnings;
+
 void unescape_xml_entities(char* str);
 void escape_tsv_value(const char* input, char* output, int max_len);
 
@@ -127,6 +177,28 @@ static void init_workbook(Workbook* wb) {
 static void free_workbook(Workbook* wb) {
     free(wb->sheets);
     init_workbook(wb);
+}
+
+static void add_sheet_warning(SheetInfo* sheet, const char* code, const char* message) {
+    if (sheet->warning_count >= MAX_SHEET_WARNINGS) {
+        return;
+    }
+
+    strncpy(sheet->warnings[sheet->warning_count].code, code, MAX_WARNING_CODE - 1);
+    sheet->warnings[sheet->warning_count].code[MAX_WARNING_CODE - 1] = '\0';
+    strncpy(sheet->warnings[sheet->warning_count].message, message, MAX_WARNING_MESSAGE - 1);
+    sheet->warnings[sheet->warning_count].message[MAX_WARNING_MESSAGE - 1] = '\0';
+    sheet->warning_count++;
+}
+
+static void add_global_warning(GlobalWarnings* warnings, const char* message) {
+    if (warnings->count >= MAX_SHEET_WARNINGS) {
+        return;
+    }
+
+    strncpy(warnings->messages[warnings->count], message, MAX_WARNING_MESSAGE - 1);
+    warnings->messages[warnings->count][MAX_WARNING_MESSAGE - 1] = '\0';
+    warnings->count++;
 }
 
 static void ensure_workbook_capacity(Workbook* wb, int needed) {
@@ -241,6 +313,7 @@ static inline int find_attribute_in_range(const char* start, const char* end,
 #define FIND_ATTR_MAX(xml, buf, sz) find_attribute(xml, "max=", 4, buf, sz)
 #define FIND_ATTR_HIDDEN(xml, buf, sz) find_attribute(xml, "hidden=", 7, buf, sz)
 #define FIND_ATTR_REF(xml, buf, sz) find_attribute(xml, "ref=", 4, buf, sz)
+#define FIND_ATTR_STATE(xml, buf, sz) find_attribute(xml, "state=", 6, buf, sz)
 
 static inline bool is_xml_name_char(char c) {
     return isalnum((unsigned char)c) || c == '_' || c == ':' || c == '-' || c == '.';
@@ -1404,6 +1477,7 @@ void parse_workbook(const char* xml_data, Workbook* wb, bool export_all_sheets) 
     char name_attr[MAX_SHEET_NAME];
     char sheet_id_attr[32];
     char rel_id_attr[MAX_REL_ID];
+    char state_attr[MAX_SHEET_STATE];
 
     while ((pos = strstr(pos, "<sheet ")) != NULL) {
         // 시트 이름 추출
@@ -1438,7 +1512,23 @@ void parse_workbook(const char* xml_data, Workbook* wb, bool export_all_sheets) 
         wb->sheets[wb->sheet_count].rel_id[MAX_REL_ID - 1] = '\0';
         wb->sheets[wb->sheet_count].filename[0] = '\0';
         wb->sheets[wb->sheet_count].output_name[0] = '\0';
+        if (FIND_ATTR_STATE(pos, state_attr, sizeof(state_attr)) >= 0) {
+            strncpy(wb->sheets[wb->sheet_count].state, state_attr, MAX_SHEET_STATE - 1);
+            wb->sheets[wb->sheet_count].state[MAX_SHEET_STATE - 1] = '\0';
+        } else {
+            strncpy(wb->sheets[wb->sheet_count].state, "visible", MAX_SHEET_STATE - 1);
+            wb->sheets[wb->sheet_count].state[MAX_SHEET_STATE - 1] = '\0';
+        }
         wb->sheets[wb->sheet_count].sheet_id = sheet_id;
+        wb->sheets[wb->sheet_count].hidden = strcmp(wb->sheets[wb->sheet_count].state, "visible") != 0;
+        wb->sheets[wb->sheet_count].selected = true;
+        wb->sheets[wb->sheet_count].processed = false;
+        wb->sheets[wb->sheet_count].truncated = false;
+        wb->sheets[wb->sheet_count].emitted_rows = 0;
+        wb->sheets[wb->sheet_count].emitted_cols = 0;
+        wb->sheets[wb->sheet_count].approx_rows = -1;
+        wb->sheets[wb->sheet_count].approx_cols = -1;
+        wb->sheets[wb->sheet_count].warning_count = 0;
 
         wb->sheet_count++;
         pos++;
@@ -1953,6 +2043,225 @@ static void join_output_path(const char* output_dir, const char* filename,
     }
 }
 
+static bool output_name_exists(char used_names[][MAX_OUTPUT_FILENAME], int used_count, const char* output_filename) {
+    for (int i = 0; i < used_count; i++) {
+        if (strcmp(used_names[i], output_filename) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void parse_sheet_dimension_xml(const char* xml_data, int* row_count, int* col_count) {
+    const char* pos = strstr(xml_data, "<dimension ");
+    char ref_attr[64];
+    char start_ref[32];
+    char end_ref[32];
+    const char* separator;
+    int start_row;
+    int start_col;
+    int end_row;
+    int end_col;
+
+    *row_count = -1;
+    *col_count = -1;
+
+    if (!pos || FIND_ATTR_REF(pos, ref_attr, sizeof(ref_attr)) < 0) {
+        return;
+    }
+
+    separator = strchr(ref_attr, ':');
+    if (separator) {
+        size_t start_len = (size_t)(separator - ref_attr);
+        if (start_len >= sizeof(start_ref)) {
+            start_len = sizeof(start_ref) - 1;
+        }
+        memcpy(start_ref, ref_attr, start_len);
+        start_ref[start_len] = '\0';
+        strncpy(end_ref, separator + 1, sizeof(end_ref) - 1);
+        end_ref[sizeof(end_ref) - 1] = '\0';
+    } else {
+        strncpy(start_ref, ref_attr, sizeof(start_ref) - 1);
+        start_ref[sizeof(start_ref) - 1] = '\0';
+        strncpy(end_ref, ref_attr, sizeof(end_ref) - 1);
+        end_ref[sizeof(end_ref) - 1] = '\0';
+    }
+
+    if (parse_cell_ref(start_ref, &start_row, &start_col) &&
+        parse_cell_ref(end_ref, &end_row, &end_col)) {
+        *row_count = end_row - start_row + 1;
+        *col_count = end_col - start_col + 1;
+    }
+}
+
+static bool sheet_matches_filters(const SheetInfo* sheet,
+                                  char sheet_names[][MAX_SHEET_NAME], int sheet_name_count,
+                                  regex_t* sheet_regex, bool has_sheet_regex) {
+    if (sheet_name_count == 0 && !has_sheet_regex) {
+        return true;
+    }
+
+    for (int i = 0; i < sheet_name_count; i++) {
+        if (strcmp(sheet->name, sheet_names[i]) == 0) {
+            return true;
+        }
+    }
+
+    if (has_sheet_regex && regexec(sheet_regex, sheet->name, 0, NULL, 0) == 0) {
+        return true;
+    }
+
+    return false;
+}
+
+static void json_write_string(FILE* fp, const char* value) {
+    const unsigned char* pos = (const unsigned char*)(value ? value : "");
+    fputc('"', fp);
+    while (*pos) {
+        switch (*pos) {
+            case '\\':
+                fputs("\\\\", fp);
+                break;
+            case '"':
+                fputs("\\\"", fp);
+                break;
+            case '\b':
+                fputs("\\b", fp);
+                break;
+            case '\f':
+                fputs("\\f", fp);
+                break;
+            case '\n':
+                fputs("\\n", fp);
+                break;
+            case '\r':
+                fputs("\\r", fp);
+                break;
+            case '\t':
+                fputs("\\t", fp);
+                break;
+            default:
+                if (*pos < 0x20) {
+                    fprintf(fp, "\\u%04x", *pos);
+                } else {
+                    fputc(*pos, fp);
+                }
+                break;
+        }
+        pos++;
+    }
+    fputc('"', fp);
+}
+
+static void json_write_sheet_warnings(FILE* fp, const SheetInfo* sheet) {
+    fputc('[', fp);
+    for (int i = 0; i < sheet->warning_count; i++) {
+        if (i > 0) {
+            fputc(',', fp);
+        }
+        fputs("{\"code\":", fp);
+        json_write_string(fp, sheet->warnings[i].code);
+        fputs(",\"message\":", fp);
+        json_write_string(fp, sheet->warnings[i].message);
+        fputc('}', fp);
+    }
+    fputc(']', fp);
+}
+
+static void write_manifest_json(FILE* fp, const char* input_file,
+                                const RunOptions* options, const Workbook* workbook,
+                                const GlobalWarnings* global_warnings) {
+    int first = 1;
+    int selected_count = 0;
+    int processed_count = 0;
+
+    for (int i = 0; i < workbook->sheet_count; i++) {
+        if (workbook->sheets[i].selected) {
+            selected_count++;
+        }
+        if (workbook->sheets[i].processed) {
+            processed_count++;
+        }
+    }
+
+    fputs("{\"tool_version\":", fp);
+    json_write_string(fp, TOOL_VERSION);
+    fputs(",\"input_file\":", fp);
+    json_write_string(fp, input_file);
+    fputs(",\"mode\":", fp);
+    json_write_string(fp, options->game_db_fast_mode ? "game-db-fast" : "generic");
+    fputs(",\"output_format\":", fp);
+    json_write_string(fp, options->output_format == OUTPUT_FORMAT_CSV ? "csv" :
+                          options->output_format == OUTPUT_FORMAT_JSONL ? "jsonl" : "tsv");
+    fprintf(fp, ",\"start_row\":%d", options->start_row + 1);
+    fputs(",\"output_dir\":", fp);
+    json_write_string(fp, options->output_dir ? options->output_dir : "");
+    fprintf(fp, ",\"selected_sheet_count\":%d", selected_count);
+    fprintf(fp, ",\"processed_sheet_count\":%d", processed_count);
+    fprintf(fp, ",\"truncated\":%s", global_warnings->truncated ? "true" : "false");
+    fputs(",\"warnings\":[", fp);
+    for (int i = 0; i < global_warnings->count; i++) {
+        if (i > 0) {
+            fputc(',', fp);
+        }
+        json_write_string(fp, global_warnings->messages[i]);
+    }
+    fputs("],\"sheets\":[", fp);
+
+    for (int i = 0; i < workbook->sheet_count; i++) {
+        const SheetInfo* sheet = &workbook->sheets[i];
+        if (!sheet->selected && !sheet->processed && sheet->warning_count == 0) {
+            continue;
+        }
+        if (!first) {
+            fputc(',', fp);
+        }
+        first = 0;
+        fputs("{\"sheet_name\":", fp);
+        json_write_string(fp, sheet->name);
+        fputs(",\"state\":", fp);
+        json_write_string(fp, sheet->state);
+        fprintf(fp, ",\"hidden\":%s", sheet->hidden ? "true" : "false");
+        fprintf(fp, ",\"selected\":%s", sheet->selected ? "true" : "false");
+        fprintf(fp, ",\"processed\":%s", sheet->processed ? "true" : "false");
+        fprintf(fp, ",\"truncated\":%s", sheet->truncated ? "true" : "false");
+        fputs(",\"output_path\":", fp);
+        if (sheet->output_name[0] != '\0') {
+            json_write_string(fp, sheet->output_name);
+        } else {
+            fputs("null", fp);
+        }
+        fprintf(fp, ",\"rows_emitted\":%d,\"cols_emitted\":%d", sheet->emitted_rows, sheet->emitted_cols);
+        fprintf(fp, ",\"approx_rows\":%d,\"approx_cols\":%d", sheet->approx_rows, sheet->approx_cols);
+        fputs(",\"warnings\":", fp);
+        json_write_sheet_warnings(fp, sheet);
+        fputc('}', fp);
+    }
+
+    fputs("]}", fp);
+}
+
+static void write_list_sheets_json(FILE* fp, const Workbook* workbook) {
+    fputs("{\"tool_version\":", fp);
+    json_write_string(fp, TOOL_VERSION);
+    fputs(",\"sheets\":[", fp);
+    for (int i = 0; i < workbook->sheet_count; i++) {
+        const SheetInfo* sheet = &workbook->sheets[i];
+        if (i > 0) {
+            fputc(',', fp);
+        }
+        fputs("{\"sheet_name\":", fp);
+        json_write_string(fp, sheet->name);
+        fputs(",\"state\":", fp);
+        json_write_string(fp, sheet->state);
+        fprintf(fp, ",\"hidden\":%s", sheet->hidden ? "true" : "false");
+        fprintf(fp, ",\"selected\":%s", sheet->selected ? "true" : "false");
+        fprintf(fp, ",\"approx_rows\":%d,\"approx_cols\":%d", sheet->approx_rows, sheet->approx_cols);
+        fputc('}', fp);
+    }
+    fputs("]}", fp);
+}
+
 // 고성능 워크시트 파서
 void parse_worksheet(const char* xml_data, SharedStrings* ss, int start_row, Filter* output) {
     const char* pos = xml_data;
@@ -1963,7 +2272,7 @@ void parse_worksheet(const char* xml_data, SharedStrings* ss, int start_row, Fil
     char t_attr[32];
     char cell_value[MAX_CELL_VALUE];
 
-    while ((pos = strstr(pos, "<c ")) != NULL) {
+    while (!filter_should_stop(output) && (pos = strstr(pos, "<c ")) != NULL) {
         const char* tag_close = strchr(pos, '>');
         const char* cell_content_end;
         const char* cell_end;
@@ -2010,6 +2319,9 @@ void parse_worksheet(const char* xml_data, SharedStrings* ss, int start_row, Fil
             printf("DEBUG: New row, outputting newline\n");
 #endif
             last_col = -1;
+            if (filter_should_stop(output)) {
+                break;
+            }
         }
 
         // 빈 열을 탭으로 채우기 (last_col과 현재 col 사이의 열들)
@@ -2084,7 +2396,7 @@ void parse_worksheet(const char* xml_data, SharedStrings* ss, int start_row, Fil
     }
 
     // 행을 처리한 경우 마지막 개행 출력
-    if (last_row >= start_row) {
+    if (last_row >= start_row && !filter_should_stop(output)) {
         filter_finish_line(output);
     }
 }
@@ -2157,7 +2469,8 @@ void parse_worksheet_generic(const char* xml_data, SharedStrings* ss, const Styl
 
     init_row_buffer(&row_buffer);
 
-    while ((pos = find_next_start_tag_local(pos, xml_end, "row")) != NULL) {
+    while (!filter_should_stop(output) &&
+           (pos = find_next_start_tag_local(pos, xml_end, "row")) != NULL) {
         const char* row_tag_end = find_tag_end_in_range(pos, xml_end);
         const char* row_content_start;
         const char* row_close;
@@ -2201,6 +2514,9 @@ void parse_worksheet_generic(const char* xml_data, SharedStrings* ss, const Styl
             if (synthetic_start < row) {
                 emit_synthetic_merge_rows(synthetic_start, row, hidden_columns, merge_regions,
                                           target_max_col, &row_buffer, output);
+                if (filter_should_stop(output)) {
+                    break;
+                }
             }
         }
 
@@ -2266,6 +2582,9 @@ void parse_worksheet_generic(const char* xml_data, SharedStrings* ss, const Styl
 
         if (row >= start_row && !row_hidden) {
             emit_row_buffer(&row_buffer, hidden_columns, target_max_col, target_max_col < 0, output);
+            if (filter_should_stop(output)) {
+                break;
+            }
         }
 
         last_parsed_row = row;
@@ -2298,42 +2617,9 @@ void free_shared_strings(SharedStrings* ss) {
 }
 
 int main(int argc, char* argv[]) {
-    if (argc < 2) {
-        printf("Usage: %s <input.xlsx> [start_row] [--mode generic|game-db-fast] [--output-dir dir] [--no-wildcard] [--formatted] [--expand-merged] [--skip-hidden] [--csv] [--jsonl]\n", argv[0]);
-        printf("  start_row: 1-based row number to start conversion (default: 1)\n");
-        printf("             Rows before start_row are ignored\n");
-        printf("             Default generic mode exports rows from start_row as-is\n");
-        printf("             --mode game-db-fast uses the start_row row as the TSV header row\n");
-        printf("  --mode generic|game-db-fast: Select export mode (default: generic)\n");
-        printf("  --output-dir dir: Write output files under an existing directory\n");
-        printf("  --all-sheets: Legacy alias for generic mode\n");
-        printf("  --no-wildcard: Game DB fast mode only; skip sheets/columns containing *\n");
-        printf("  --formatted: Generic mode only; use styles.xml number formats for human-readable values\n");
-        printf("  --expand-merged: Generic mode only; fill merged cells with the top-left value\n");
-        printf("  --skip-hidden: Generic mode only; skip hidden rows and hidden columns\n");
-        printf("  --csv: Generic mode only; write CSV files instead of TSV\n");
-        printf("  --jsonl: Generic mode only; write JSONL using the first emitted row as field names\n");
-        printf("\n");
-        printf("Wildcard (*) character behavior:\n");
-        printf("  Generic mode:\n");
-        printf("    - * characters are preserved in sheet/header text\n");
-        printf("    - Output filenames still sanitize unsafe filesystem characters\n");
-        printf("  Game DB fast mode:\n");
-        printf("    - * characters are removed from sheet/column names in output\n");
-        printf("    - Example: '*Sales' -> 'Sales.tsv', '*ID' column -> 'ID'\n");
-        printf("  --no-wildcard mode:\n");
-        printf("    - Sheets containing * will be skipped entirely\n");
-        printf("    - Columns containing * will be excluded from output\n");
-        printf("\n");
-        printf("Note: Generic mode is now the default and exports every worksheet\n");
-        printf("      --mode game-db-fast enables the original sheet/header filtering fast path\n");
-        printf("      --formatted, --expand-merged, --skip-hidden, --csv, and --jsonl require generic mode\n");
-        return 1;
-    }
-    
-    const char* input_file = argv[1];
+    const char* input_file;
     int start_row = 0;
-    bool export_all_sheets = true;
+    bool export_all_sheets;
     bool game_db_fast_mode = false;
     bool formatted_output = false;
     bool expand_merged_cells = false;
@@ -2343,39 +2629,213 @@ int main(int argc, char* argv[]) {
     bool start_row_set = false;
     OutputFormat output_format = OUTPUT_FORMAT_TSV;
     const char* output_dir = NULL;
+    bool list_sheets = false;
+    bool json_output = false;
+    bool manifest_stdout = false;
+    const char* manifest_json_path = NULL;
+    bool stdout_output = false;
+    bool fail_if_no_sheet = false;
+    bool fail_on_output_collision = false;
+    bool fail_if_truncated = false;
+    int max_sheets = 0;
+    int max_rows_per_sheet = 0;
+    size_t max_output_bytes = 0;
+    char sheet_names[MAX_SHEET_FILTERS][MAX_SHEET_NAME];
+    int sheet_name_count = 0;
+    const char* sheet_regex_pattern = NULL;
+    regex_t sheet_regex;
+    bool regex_compiled = false;
+    bool zip_open = false;
+    int processed_sheets = 0;
+    int selected_sheets = 0;
+    int exit_code = 1;
+    size_t total_output_bytes = 0;
+    char (*used_output_names)[MAX_OUTPUT_FILENAME] = NULL;
+    GlobalWarnings global_warnings = {0};
+    Styles styles;
+    SharedStrings shared_strings;
+    Workbook workbook;
+    mz_zip_archive zip;
+    RunOptions run_options = {0};
+
+    g_log_fp = stdout;
+    init_styles(&styles);
+    styles.enabled = false;
+    init_shared_strings(&shared_strings);
+    init_workbook(&workbook);
+
+    if (argc == 2 && strcmp(argv[1], "--version") == 0) {
+        fprintf(stdout, "xlsx2tsv %s\n", TOOL_VERSION);
+        free_shared_strings(&shared_strings);
+        free_styles(&styles);
+        free_workbook(&workbook);
+        return 0;
+    }
+
+    if (argc < 2 || argv[1][0] == '-') {
+        fprintf(stdout, "Usage: %s <input.xlsx> [start_row] [--mode generic|game-db-fast] [--output-dir dir] [--sheet name] [--sheet-regex pattern] [--list-sheets] [--json] [--manifest-json path] [--manifest-stdout] [--stdout] [--max-sheets n] [--max-rows-per-sheet n] [--max-output-bytes n] [--fail-if-truncated] [--fail-if-no-sheet] [--fail-on-output-collision] [--no-wildcard] [--formatted] [--expand-merged] [--skip-hidden] [--csv] [--jsonl]\n", argv[0]);
+        fprintf(stdout, "  --version: Print a stable version string and exit\n");
+        fprintf(stdout, "  --sheet name: Select one sheet by exact name (repeatable)\n");
+        fprintf(stdout, "  --sheet-regex pattern: Select sheets by POSIX regex\n");
+        fprintf(stdout, "  --list-sheets: Inspect workbook sheets without converting\n");
+        fprintf(stdout, "  --json: Emit JSON for --list-sheets\n");
+        fprintf(stdout, "  --manifest-json path / --manifest-stdout: Write conversion manifest JSON\n");
+        fprintf(stdout, "  --stdout: Write a single selected sheet to stdout\n");
+        fprintf(stdout, "  --max-sheets / --max-rows-per-sheet / --max-output-bytes: Resource guards\n");
+        fprintf(stdout, "  --fail-if-truncated / --fail-if-no-sheet / --fail-on-output-collision: Strict modes\n");
+        free_shared_strings(&shared_strings);
+        free_styles(&styles);
+        free_workbook(&workbook);
+        return 1;
+    }
+
+    input_file = argv[1];
 
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "--mode") == 0) {
             if (i + 1 >= argc) {
-                printf("Error: --mode requires a value: generic or game-db-fast\n");
-                return 1;
+                fprintf(stderr, "Error: --mode requires a value: generic or game-db-fast\n");
+                goto cleanup;
             }
-
             i++;
             if (strcmp(argv[i], "generic") == 0) {
                 game_db_fast_mode = false;
             } else if (strcmp(argv[i], "game-db-fast") == 0) {
                 game_db_fast_mode = true;
             } else {
-                printf("Error: Unknown mode: %s (expected generic or game-db-fast)\n", argv[i]);
-                return 1;
+                fprintf(stderr, "Error: Unknown mode: %s (expected generic or game-db-fast)\n", argv[i]);
+                goto cleanup;
             }
             continue;
         }
 
         if (strcmp(argv[i], "--output-dir") == 0) {
             struct stat st;
-
             if (i + 1 >= argc) {
-                printf("Error: --output-dir requires a directory path\n");
-                return 1;
+                fprintf(stderr, "Error: --output-dir requires a directory path\n");
+                goto cleanup;
             }
-
             output_dir = argv[++i];
             if (stat(output_dir, &st) != 0 || !S_ISDIR(st.st_mode)) {
-                printf("Error: Output directory does not exist or is not a directory: %s\n", output_dir);
-                return 1;
+                fprintf(stderr, "Error: Output directory does not exist or is not a directory: %s\n", output_dir);
+                goto cleanup;
             }
+            continue;
+        }
+
+        if (strcmp(argv[i], "--sheet") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Error: --sheet requires a sheet name\n");
+                goto cleanup;
+            }
+            if (sheet_name_count >= MAX_SHEET_FILTERS) {
+                fprintf(stderr, "Error: Too many --sheet filters\n");
+                goto cleanup;
+            }
+            strncpy(sheet_names[sheet_name_count], argv[++i], MAX_SHEET_NAME - 1);
+            sheet_names[sheet_name_count][MAX_SHEET_NAME - 1] = '\0';
+            sheet_name_count++;
+            continue;
+        }
+
+        if (strcmp(argv[i], "--sheet-regex") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Error: --sheet-regex requires a pattern\n");
+                goto cleanup;
+            }
+            sheet_regex_pattern = argv[++i];
+            continue;
+        }
+
+        if (strcmp(argv[i], "--list-sheets") == 0) {
+            list_sheets = true;
+            continue;
+        }
+
+        if (strcmp(argv[i], "--json") == 0) {
+            json_output = true;
+            continue;
+        }
+
+        if (strcmp(argv[i], "--manifest-json") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Error: --manifest-json requires a file path\n");
+                goto cleanup;
+            }
+            manifest_json_path = argv[++i];
+            continue;
+        }
+
+        if (strcmp(argv[i], "--manifest-stdout") == 0) {
+            manifest_stdout = true;
+            continue;
+        }
+
+        if (strcmp(argv[i], "--stdout") == 0) {
+            stdout_output = true;
+            continue;
+        }
+
+        if (strcmp(argv[i], "--fail-if-no-sheet") == 0) {
+            fail_if_no_sheet = true;
+            continue;
+        }
+
+        if (strcmp(argv[i], "--fail-on-output-collision") == 0) {
+            fail_on_output_collision = true;
+            continue;
+        }
+
+        if (strcmp(argv[i], "--fail-if-truncated") == 0) {
+            fail_if_truncated = true;
+            continue;
+        }
+
+        if (strcmp(argv[i], "--max-sheets") == 0) {
+            char* end_ptr = NULL;
+            long parsed_value;
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Error: --max-sheets requires a value\n");
+                goto cleanup;
+            }
+            parsed_value = strtol(argv[++i], &end_ptr, 10);
+            if (!end_ptr || *end_ptr != '\0' || parsed_value <= 0) {
+                fprintf(stderr, "Error: Invalid --max-sheets value: %s\n", argv[i]);
+                goto cleanup;
+            }
+            max_sheets = (int)parsed_value;
+            continue;
+        }
+
+        if (strcmp(argv[i], "--max-rows-per-sheet") == 0) {
+            char* end_ptr = NULL;
+            long parsed_value;
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Error: --max-rows-per-sheet requires a value\n");
+                goto cleanup;
+            }
+            parsed_value = strtol(argv[++i], &end_ptr, 10);
+            if (!end_ptr || *end_ptr != '\0' || parsed_value <= 0) {
+                fprintf(stderr, "Error: Invalid --max-rows-per-sheet value: %s\n", argv[i]);
+                goto cleanup;
+            }
+            max_rows_per_sheet = (int)parsed_value;
+            continue;
+        }
+
+        if (strcmp(argv[i], "--max-output-bytes") == 0) {
+            char* end_ptr = NULL;
+            unsigned long long parsed_value;
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Error: --max-output-bytes requires a value\n");
+                goto cleanup;
+            }
+            parsed_value = strtoull(argv[++i], &end_ptr, 10);
+            if (!end_ptr || *end_ptr != '\0' || parsed_value == 0) {
+                fprintf(stderr, "Error: Invalid --max-output-bytes value: %s\n", argv[i]);
+                goto cleanup;
+            }
+            max_output_bytes = (size_t)parsed_value;
             continue;
         }
 
@@ -2415,6 +2875,12 @@ int main(int argc, char* argv[]) {
             continue;
         }
 
+        if (strcmp(argv[i], "--version") == 0) {
+            fprintf(stdout, "xlsx2tsv %s\n", TOOL_VERSION);
+            exit_code = 0;
+            goto cleanup;
+        }
+
         char* end_ptr = NULL;
         long parsed_row = strtol(argv[i], &end_ptr, 10);
         if (!start_row_set && argv[i][0] != '\0' && end_ptr && *end_ptr == '\0') {
@@ -2423,24 +2889,220 @@ int main(int argc, char* argv[]) {
             continue;
         }
 
-        printf("Error: Unknown argument: %s\n", argv[i]);
-        return 1;
+        fprintf(stderr, "Error: Unknown argument: %s\n", argv[i]);
+        goto cleanup;
     }
 
-    if (start_row < 0) start_row = 0;
+    if (start_row < 0) {
+        start_row = 0;
+    }
+
+    if (sheet_regex_pattern) {
+        if (regcomp(&sheet_regex, sheet_regex_pattern, REG_EXTENDED | REG_NOSUB) != 0) {
+            fprintf(stderr, "Error: Invalid --sheet-regex pattern: %s\n", sheet_regex_pattern);
+            goto cleanup;
+        }
+        regex_compiled = true;
+    }
+
+    if (json_output && !list_sheets) {
+        fprintf(stderr, "Error: --json is only supported with --list-sheets\n");
+        goto cleanup;
+    }
+
+    if (manifest_stdout && manifest_json_path) {
+        fprintf(stderr, "Error: --manifest-stdout cannot be combined with --manifest-json\n");
+        goto cleanup;
+    }
+
+    if (manifest_stdout && stdout_output) {
+        fprintf(stderr, "Error: --manifest-stdout cannot be combined with --stdout\n");
+        goto cleanup;
+    }
+
+    if (stdout_output && output_dir) {
+        fprintf(stderr, "Error: --stdout cannot be combined with --output-dir\n");
+        goto cleanup;
+    }
+
+    if (stdout_output && fail_on_output_collision) {
+        fprintf(stderr, "Error: --stdout cannot be combined with --fail-on-output-collision\n");
+        goto cleanup;
+    }
+
+    if (list_sheets &&
+        (formatted_output || expand_merged_cells || skip_hidden || manifest_stdout ||
+         manifest_json_path || stdout_output || output_dir || output_format != OUTPUT_FORMAT_TSV ||
+         max_sheets > 0 || max_rows_per_sheet > 0 || max_output_bytes > 0 ||
+         fail_if_truncated || fail_on_output_collision || no_wildcard_mode || all_sheets_alias)) {
+        fprintf(stderr, "Error: --list-sheets cannot be combined with conversion-only options\n");
+        goto cleanup;
+    }
 
     export_all_sheets = !game_db_fast_mode;
-
     if (game_db_fast_mode &&
+        !list_sheets &&
         (formatted_output || expand_merged_cells || skip_hidden ||
          output_format != OUTPUT_FORMAT_TSV || all_sheets_alias)) {
-        printf("Error: --mode game-db-fast cannot be combined with generic-mode options\n");
-        return 1;
+        fprintf(stderr, "Error: --mode game-db-fast cannot be combined with generic-mode options\n");
+        goto cleanup;
     }
 
     if (!game_db_fast_mode && no_wildcard_mode) {
-        printf("Error: --no-wildcard requires --mode game-db-fast\n");
-        return 1;
+        fprintf(stderr, "Error: --no-wildcard requires --mode game-db-fast\n");
+        goto cleanup;
+    }
+
+    run_options.list_sheets = list_sheets;
+    run_options.json = json_output;
+    run_options.manifest_stdout = manifest_stdout;
+    run_options.manifest_json_path = manifest_json_path;
+    run_options.stdout_output = stdout_output;
+    run_options.fail_if_no_sheet = fail_if_no_sheet;
+    run_options.fail_on_output_collision = fail_on_output_collision;
+    run_options.max_sheets = max_sheets;
+    run_options.max_rows_per_sheet = max_rows_per_sheet;
+    run_options.max_output_bytes = max_output_bytes;
+    run_options.fail_if_truncated = fail_if_truncated;
+    run_options.output_dir = output_dir;
+    run_options.output_format = output_format;
+    run_options.start_row = start_row;
+    run_options.game_db_fast_mode = game_db_fast_mode;
+
+    if (stdout_output || manifest_stdout || (list_sheets && json_output)) {
+        g_log_fp = stderr;
+    } else {
+        g_log_fp = stdout;
+    }
+
+    clock_t start_time = clock();
+    styles.enabled = formatted_output;
+
+    if (!mz_zip_reader_init_file(&zip, input_file)) {
+        fprintf(stderr, "Error: Could not open XLSX file: %s\n", input_file);
+        goto cleanup;
+    }
+    zip_open = true;
+
+    int workbook_index;
+    if (!mz_zip_reader_locate_file(&zip, "xl/workbook.xml", &workbook_index)) {
+        fprintf(stderr, "Error: Could not find workbook.xml in XLSX file\n");
+        goto cleanup;
+    }
+
+    size_t workbook_size = mz_zip_reader_get_file_size(&zip, workbook_index);
+    char* workbook_data = malloc(workbook_size + 1);
+    if (!mz_zip_reader_extract_to_mem(&zip, workbook_index, workbook_data, workbook_size)) {
+        fprintf(stderr, "Error: Could not extract workbook.xml\n");
+        free(workbook_data);
+        goto cleanup;
+    }
+    workbook_data[workbook_size] = '\0';
+    styles.date_1904 = workbook_uses_1904_date_system(workbook_data);
+    parse_workbook(workbook_data, &workbook, export_all_sheets);
+    free(workbook_data);
+
+    int workbook_rels_index;
+    if (!mz_zip_reader_locate_file(&zip, "xl/_rels/workbook.xml.rels", &workbook_rels_index)) {
+        fprintf(stderr, "Error: Could not find workbook.xml.rels in XLSX file\n");
+        goto cleanup;
+    }
+
+    size_t workbook_rels_size = mz_zip_reader_get_file_size(&zip, workbook_rels_index);
+    char* workbook_rels_data = malloc(workbook_rels_size + 1);
+    if (!mz_zip_reader_extract_to_mem(&zip, workbook_rels_index, workbook_rels_data, workbook_rels_size)) {
+        fprintf(stderr, "Error: Could not extract workbook.xml.rels\n");
+        free(workbook_rels_data);
+        goto cleanup;
+    }
+    workbook_rels_data[workbook_rels_size] = '\0';
+    resolve_sheet_filenames(workbook_rels_data, &workbook);
+    free(workbook_rels_data);
+
+    if (workbook.sheet_count == 0) {
+        fprintf(stderr, export_all_sheets ?
+                "No sheets found in workbook\n" :
+                "No valid sheets found (sheets must contain only A-Z, a-z, 0-9, -, _, *)\n");
+        goto cleanup;
+    }
+
+    for (int i = 0; i < workbook.sheet_count; i++) {
+        workbook.sheets[i].selected = sheet_matches_filters(&workbook.sheets[i],
+                                                            sheet_names, sheet_name_count,
+                                                            regex_compiled ? &sheet_regex : NULL,
+                                                            regex_compiled);
+        if (workbook.sheets[i].selected) {
+            selected_sheets++;
+        }
+    }
+
+    if (selected_sheets == 0 && fail_if_no_sheet) {
+        fprintf(stderr, "Error: No sheets matched the provided sheet filters\n");
+        goto cleanup;
+    }
+
+    if (max_sheets > 0 && selected_sheets > max_sheets) {
+        int kept = 0;
+        char warning_message[MAX_WARNING_MESSAGE];
+        snprintf(warning_message, sizeof(warning_message),
+                 "Selected sheets truncated to the first %d due to --max-sheets", max_sheets);
+        add_global_warning(&global_warnings, warning_message);
+        global_warnings.truncated = true;
+
+        for (int i = 0; i < workbook.sheet_count; i++) {
+            if (!workbook.sheets[i].selected) {
+                continue;
+            }
+            if (kept < max_sheets) {
+                kept++;
+            } else {
+                workbook.sheets[i].selected = false;
+            }
+        }
+        selected_sheets = max_sheets;
+    }
+
+    if (stdout_output && selected_sheets != 1) {
+        fprintf(stderr, "Error: --stdout requires exactly one selected sheet\n");
+        goto cleanup;
+    }
+
+    if (list_sheets) {
+        for (int i = 0; i < workbook.sheet_count; i++) {
+            int worksheet_index;
+            if (workbook.sheets[i].filename[0] == '\0') {
+                continue;
+            }
+            if (!mz_zip_reader_locate_file(&zip, workbook.sheets[i].filename, &worksheet_index)) {
+                continue;
+            }
+
+            size_t worksheet_size = mz_zip_reader_get_file_size(&zip, worksheet_index);
+            char* worksheet_data = malloc(worksheet_size + 1);
+            if (!mz_zip_reader_extract_to_mem(&zip, worksheet_index, worksheet_data, worksheet_size)) {
+                free(worksheet_data);
+                continue;
+            }
+            worksheet_data[worksheet_size] = '\0';
+            parse_sheet_dimension_xml(worksheet_data, &workbook.sheets[i].approx_rows, &workbook.sheets[i].approx_cols);
+            free(worksheet_data);
+        }
+
+        if (json_output) {
+            write_list_sheets_json(stdout, &workbook);
+            fputc('\n', stdout);
+        } else {
+            for (int i = 0; i < workbook.sheet_count; i++) {
+                fprintf(stdout, "%s\t%s\t%s\t%d\t%d\n",
+                        workbook.sheets[i].name,
+                        workbook.sheets[i].state,
+                        workbook.sheets[i].selected ? "selected" : "skipped",
+                        workbook.sheets[i].approx_rows,
+                        workbook.sheets[i].approx_cols);
+            }
+        }
+        exit_code = 0;
+        goto cleanup;
     }
 
     printf("Converting XLSX to multiple TSV files...\n");
@@ -2449,116 +3111,35 @@ int main(int argc, char* argv[]) {
     if (output_dir && output_dir[0] != '\0') {
         printf("Output directory: %s\n", output_dir);
     }
-    if (export_all_sheets) {
-        printf("Mode: generic\n");
-        if (formatted_output) {
-            printf("Formatting: enabled\n");
-        }
-        if (expand_merged_cells) {
-            printf("Merged cells: expanded\n");
-        }
-        if (skip_hidden) {
-            printf("Hidden rows/columns: skipped\n");
-        }
-        if (output_format == OUTPUT_FORMAT_CSV) {
-            printf("Output format: csv\n");
-        } else if (output_format == OUTPUT_FORMAT_JSONL) {
-            printf("Output format: jsonl\n");
-        }
-    } else {
-        printf("Mode: game-db-fast\n");
-        if (no_wildcard_mode) {
-            printf("Wildcard policy: strict skip\n");
-        }
+    printf("Mode: %s\n", export_all_sheets ? "generic" : "game-db-fast");
+    if (selected_sheets > 0) {
+        printf("Selected sheets: %d\n", selected_sheets);
     }
-
-    clock_t start_time = clock();
-
-    Styles styles;
-    init_styles(&styles);
-    styles.enabled = formatted_output;
-
-    // XLSX 파일 열기
-    mz_zip_archive zip;
-    if (!mz_zip_reader_init_file(&zip, input_file)) {
-        printf("Error: Could not open XLSX file: %s\n", input_file);
-        free_styles(&styles);
-        return 1;
+    if (formatted_output) {
+        printf("Formatting: enabled\n");
     }
-
-    // 워크북 초기화 및 시트 정보 파싱
-    Workbook workbook;
-    init_workbook(&workbook);
-    int workbook_index;
-    if (!mz_zip_reader_locate_file(&zip, "xl/workbook.xml", &workbook_index)) {
-        printf("Error: Could not find workbook.xml in XLSX file\n");
-        mz_zip_reader_end(&zip);
-        free_styles(&styles);
-        free_workbook(&workbook);
-        return 1;
+    if (expand_merged_cells) {
+        printf("Merged cells: expanded\n");
     }
-
-    size_t workbook_size = mz_zip_reader_get_file_size(&zip, workbook_index);
-    char* workbook_data = malloc(workbook_size + 1);
-
-    if (!mz_zip_reader_extract_to_mem(&zip, workbook_index, workbook_data, workbook_size)) {
-        printf("Error: Could not extract workbook.xml\n");
-        free(workbook_data);
-        mz_zip_reader_end(&zip);
-        free_styles(&styles);
-        free_workbook(&workbook);
-        return 1;
+    if (skip_hidden) {
+        printf("Hidden rows/columns: skipped\n");
     }
-    
-    workbook_data[workbook_size] = '\0';
-    styles.date_1904 = workbook_uses_1904_date_system(workbook_data);
-    parse_workbook(workbook_data, &workbook, export_all_sheets);
-    free(workbook_data);
-
-    int workbook_rels_index;
-    if (!mz_zip_reader_locate_file(&zip, "xl/_rels/workbook.xml.rels", &workbook_rels_index)) {
-        printf("Error: Could not find workbook.xml.rels in XLSX file\n");
-        mz_zip_reader_end(&zip);
-        free_styles(&styles);
-        free_workbook(&workbook);
-        return 1;
+    if (output_format == OUTPUT_FORMAT_CSV) {
+        printf("Output format: csv\n");
+    } else if (output_format == OUTPUT_FORMAT_JSONL) {
+        printf("Output format: jsonl\n");
     }
-
-    size_t workbook_rels_size = mz_zip_reader_get_file_size(&zip, workbook_rels_index);
-    char* workbook_rels_data = malloc(workbook_rels_size + 1);
-
-    if (!mz_zip_reader_extract_to_mem(&zip, workbook_rels_index, workbook_rels_data, workbook_rels_size)) {
-        printf("Error: Could not extract workbook.xml.rels\n");
-        free(workbook_rels_data);
-        mz_zip_reader_end(&zip);
-        free_styles(&styles);
-        free_workbook(&workbook);
-        return 1;
+    if (stdout_output) {
+        printf("Output target: stdout\n");
     }
-
-    workbook_rels_data[workbook_rels_size] = '\0';
-    resolve_sheet_filenames(workbook_rels_data, &workbook);
-    free(workbook_rels_data);
-
-    if (workbook.sheet_count == 0) {
-        if (export_all_sheets) {
-            printf("No sheets found in workbook\n");
-        } else {
-            printf("No valid sheets found (sheets must contain only A-Z, a-z, 0-9, -, _, *)\n");
-        }
-        mz_zip_reader_end(&zip);
-        free_styles(&styles);
-        free_workbook(&workbook);
-        return 1;
+    if (max_rows_per_sheet > 0) {
+        printf("Max rows per sheet: %d\n", max_rows_per_sheet);
     }
+    if (max_output_bytes > 0) {
+        printf("Max output bytes: %zu\n", max_output_bytes);
+    }
+    printf("Found %d sheet(s) to process\n\n", selected_sheets);
 
-    printf("Found %d sheet(s) to process\n\n", workbook.sheet_count);
-
-    // 공유 문자열 초기화
-    SharedStrings shared_strings;
-    init_shared_strings(&shared_strings);
-
-    // 공유 문자열 추출 및 파싱
     int shared_strings_index;
     if (mz_zip_reader_locate_file(&zip, "xl/sharedStrings.xml", &shared_strings_index)) {
         printf("Loading shared strings...\n");
@@ -2583,19 +3164,15 @@ int main(int argc, char* argv[]) {
         if (mz_zip_reader_locate_file(&zip, "xl/styles.xml", &styles_index)) {
             size_t styles_size = mz_zip_reader_get_file_size(&zip, styles_index);
             char* styles_data = malloc(styles_size + 1);
-
             if (mz_zip_reader_extract_to_mem(&zip, styles_index, styles_data, styles_size)) {
                 styles_data[styles_size] = '\0';
                 parse_styles_xml(styles_data, &styles);
             }
-
             free(styles_data);
         }
     }
 
-    // 각 시트 처리
-    int processed_sheets = 0;
-    char (*used_output_names)[MAX_OUTPUT_FILENAME] = calloc((size_t)workbook.sheet_count, sizeof(*used_output_names));
+    used_output_names = calloc((size_t)workbook.sheet_count, sizeof(*used_output_names));
     int used_output_count = 0;
     const char* output_extension = "tsv";
     if (output_format == OUTPUT_FORMAT_CSV) {
@@ -2604,31 +3181,46 @@ int main(int argc, char* argv[]) {
         output_extension = "jsonl";
     }
 
+    int selected_index = 0;
+    bool output_limit_reached = false;
     for (int i = 0; i < workbook.sheet_count; i++) {
-        printf("Processing sheet %d/%d: '%s'\n", i + 1, workbook.sheet_count, workbook.sheets[i].name);
-
-        if (workbook.sheets[i].filename[0] == '\0') {
-            printf("Warning: Could not resolve worksheet file for sheet: %s - skipping\n\n", workbook.sheets[i].name);
+        SheetInfo* sheet = &workbook.sheets[i];
+        if (!sheet->selected) {
             continue;
         }
 
-        // 워크시트 추출 및 파싱
+        if (output_limit_reached) {
+            add_sheet_warning(sheet, "max-output-bytes", "Sheet was skipped after --max-output-bytes was reached");
+            continue;
+        }
+
+        selected_index++;
+        printf("Processing sheet %d/%d: '%s'\n", selected_index, selected_sheets, sheet->name);
+
+        if (sheet->filename[0] == '\0') {
+            add_sheet_warning(sheet, "missing-worksheet", "Could not resolve worksheet file for sheet");
+            printf("Warning: Could not resolve worksheet file for sheet: %s - skipping\n\n", sheet->name);
+            continue;
+        }
+
         int worksheet_index;
-        if (!mz_zip_reader_locate_file(&zip, workbook.sheets[i].filename, &worksheet_index)) {
-            printf("Warning: Could not find worksheet file: %s - skipping\n\n", workbook.sheets[i].filename);
+        if (!mz_zip_reader_locate_file(&zip, sheet->filename, &worksheet_index)) {
+            add_sheet_warning(sheet, "missing-worksheet", "Could not find worksheet file in archive");
+            printf("Warning: Could not find worksheet file: %s - skipping\n\n", sheet->filename);
             continue;
         }
-        
+
         size_t worksheet_size = mz_zip_reader_get_file_size(&zip, worksheet_index);
         char* worksheet_data = malloc(worksheet_size + 1);
-        
         if (!mz_zip_reader_extract_to_mem(&zip, worksheet_index, worksheet_data, worksheet_size)) {
-            printf("Warning: Could not extract worksheet data for: %s - skipping\n\n", workbook.sheets[i].name);
+            add_sheet_warning(sheet, "extract-failed", "Could not extract worksheet data");
+            printf("Warning: Could not extract worksheet data for: %s - skipping\n\n", sheet->name);
             free(worksheet_data);
             continue;
         }
-        
+
         worksheet_data[worksheet_size] = '\0';
+        parse_sheet_dimension_xml(worksheet_data, &sheet->approx_rows, &sheet->approx_cols);
 
         HiddenColumns hidden_columns;
         MergeRegions merge_regions;
@@ -2644,34 +3236,58 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        // 안전한 출력 파일명 생성
-        char output_filename[MAX_OUTPUT_FILENAME];
-        char output_path[MAX_OUTPUT_PATH];
-        create_unique_output_filename(workbook.sheets[i].name, i, used_output_names, used_output_count,
-                                      output_extension, output_filename, sizeof(output_filename));
-        join_output_path(output_dir, output_filename, output_path, sizeof(output_path));
+        Filter* output = NULL;
+        if (stdout_output) {
+            output = filter_init_stream(stdout,
+                                        export_all_sheets ? FILTER_MODE_RAW : FILTER_MODE_GAME_DB,
+                                        output_format);
+        } else {
+            char output_filename[MAX_OUTPUT_FILENAME];
+            char output_path[MAX_OUTPUT_PATH];
 
-        // 출력 파일 열기
-        Filter* output = filter_init(output_path,
-                                     export_all_sheets ? FILTER_MODE_RAW : FILTER_MODE_GAME_DB,
-                                     output_format);
+            create_safe_filename(sheet->name, output_extension, output_filename, sizeof(output_filename));
+            bool collision = output_name_exists(used_output_names, used_output_count, output_filename);
+            if (collision && fail_on_output_collision) {
+                fprintf(stderr, "Error: Output filename collision detected for sheet: %s\n", sheet->name);
+                free_hidden_columns(&hidden_columns);
+                free_merge_regions(&merge_regions);
+                free(worksheet_data);
+                goto cleanup;
+            }
+
+            if (collision) {
+                add_sheet_warning(sheet, "output-collision", "Output filename collision resolved with suffix");
+            }
+
+            create_unique_output_filename(sheet->name, i, used_output_names, used_output_count,
+                                          output_extension, output_filename, sizeof(output_filename));
+            join_output_path(output_dir, output_filename, output_path, sizeof(output_path));
+
+            output = filter_init(output_path,
+                                 export_all_sheets ? FILTER_MODE_RAW : FILTER_MODE_GAME_DB,
+                                 output_format);
+            if (output) {
+                strncpy(sheet->output_name, output_path, MAX_OUTPUT_PATH - 1);
+                sheet->output_name[MAX_OUTPUT_PATH - 1] = '\0';
+                strncpy(used_output_names[used_output_count], output_filename, MAX_OUTPUT_FILENAME - 1);
+                used_output_names[used_output_count][MAX_OUTPUT_FILENAME - 1] = '\0';
+                used_output_count++;
+                printf("  Output file: %s\n", output_path);
+            }
+        }
+
         if (!output) {
-            printf("Warning: Could not create output file: %s - skipping\n\n", output_path);
+            add_sheet_warning(sheet, "output-open-failed", "Could not create output target");
+            printf("Warning: Could not create output target for sheet: %s - skipping\n\n", sheet->name);
             free_hidden_columns(&hidden_columns);
             free_merge_regions(&merge_regions);
             free(worksheet_data);
             continue;
         }
 
-        strncpy(workbook.sheets[i].output_name, output_path, MAX_OUTPUT_PATH - 1);
-        workbook.sheets[i].output_name[MAX_OUTPUT_PATH - 1] = '\0';
-        strncpy(used_output_names[used_output_count], output_filename, MAX_OUTPUT_FILENAME - 1);
-        used_output_names[used_output_count][MAX_OUTPUT_FILENAME - 1] = '\0';
-        used_output_count++;
+        filter_set_limits(output, max_rows_per_sheet, max_output_bytes,
+                          max_output_bytes > 0 ? &total_output_bytes : NULL);
 
-        printf("  Output file: %s\n", output_path);
-
-        // 워크시트 파싱 및 TSV 생성
         if (export_all_sheets) {
             parse_worksheet_generic(worksheet_data, &shared_strings, &styles,
                                     &hidden_columns, &merge_regions, start_row,
@@ -2680,40 +3296,94 @@ int main(int argc, char* argv[]) {
             parse_worksheet(worksheet_data, &shared_strings, start_row, output);
         }
 
-        // 이 시트에 대한 정리
+        sheet->emitted_rows = filter_row_count(output);
+        sheet->emitted_cols = filter_max_cols(output);
+        sheet->truncated = filter_was_truncated(output);
+        bool output_limit_hit = filter_hit_output_limit(output);
+        if (sheet->truncated) {
+            global_warnings.truncated = true;
+            if (max_rows_per_sheet > 0 && sheet->emitted_rows >= max_rows_per_sheet) {
+                add_sheet_warning(sheet, "max-rows-per-sheet", "Sheet output was truncated by --max-rows-per-sheet");
+            }
+            if (output_limit_hit) {
+                add_sheet_warning(sheet, "max-output-bytes", "Output was truncated by --max-output-bytes");
+                add_global_warning(&global_warnings, "Output was truncated by --max-output-bytes");
+                output_limit_reached = true;
+            }
+        }
+
         filter_close(output);
         free_hidden_columns(&hidden_columns);
         free_merge_regions(&merge_regions);
         free(worksheet_data);
+        sheet->processed = true;
         processed_sheets++;
 
-        printf("  Sheet '%s' processed successfully!\n\n", workbook.sheets[i].name);
+        printf("  Sheet '%s' processed successfully!\n\n", sheet->name);
+
+        if (!output_limit_reached &&
+            max_output_bytes > 0 &&
+            total_output_bytes >= max_output_bytes &&
+            selected_index < selected_sheets) {
+            global_warnings.truncated = true;
+            add_global_warning(&global_warnings, "Further sheets were skipped after --max-output-bytes was reached");
+            output_limit_reached = true;
+        }
+
+        if (output_limit_reached) {
+            printf("Stopping further sheet conversion because --max-output-bytes was reached.\n\n");
+        }
     }
-    mz_zip_reader_end(&zip);
-    free_shared_strings(&shared_strings);
-    free_styles(&styles);
-    free(used_output_names);
-    
+
+    if (manifest_json_path) {
+        FILE* manifest_fp = fopen(manifest_json_path, "w");
+        if (!manifest_fp) {
+            fprintf(stderr, "Error: Could not create manifest file: %s\n", manifest_json_path);
+            goto cleanup;
+        }
+        write_manifest_json(manifest_fp, input_file, &run_options, &workbook, &global_warnings);
+        fputc('\n', manifest_fp);
+        fclose(manifest_fp);
+    }
+
+    if (manifest_stdout) {
+        write_manifest_json(stdout, input_file, &run_options, &workbook, &global_warnings);
+        fputc('\n', stdout);
+    }
+
     clock_t end_time = clock();
     double elapsed = ((double)(end_time - start_time)) / CLOCKS_PER_SEC;
-    
+
     printf("=== Conversion Summary ===\n");
-    printf("Total sheets processed: %d out of %d\n", processed_sheets, workbook.sheet_count);
+    printf("Total sheets processed: %d out of %d\n", processed_sheets, selected_sheets);
     printf("Processing time: %.2f seconds\n", elapsed);
-    
+
     if (processed_sheets > 0) {
         printf("Conversion completed successfully!\n");
-        printf("Output files created:\n");
-        for (int i = 0; i < workbook.sheet_count; i++) {
-            if (workbook.sheets[i].output_name[0] != '\0') {
-                printf("  - %s (from sheet: %s)\n", workbook.sheets[i].output_name, workbook.sheets[i].name);
+        if (!stdout_output) {
+            printf("Output files created:\n");
+            for (int i = 0; i < workbook.sheet_count; i++) {
+                if (workbook.sheets[i].output_name[0] != '\0') {
+                    printf("  - %s (from sheet: %s)\n", workbook.sheets[i].output_name, workbook.sheets[i].name);
+                }
             }
         }
-        free_workbook(&workbook);
-        return 0;
+        exit_code = fail_if_truncated && global_warnings.truncated ? 1 : 0;
     } else {
         printf("No sheets were processed successfully.\n");
-        free_workbook(&workbook);
-        return 1;
+        exit_code = 1;
     }
+
+cleanup:
+    if (regex_compiled) {
+        regfree(&sheet_regex);
+    }
+    free(used_output_names);
+    if (zip_open) {
+        mz_zip_reader_end(&zip);
+    }
+    free_shared_strings(&shared_strings);
+    free_styles(&styles);
+    free_workbook(&workbook);
+    return exit_code;
 }

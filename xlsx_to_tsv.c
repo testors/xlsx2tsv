@@ -23,9 +23,11 @@
 #define MAX_SHEET_WARNINGS 16
 #define MAX_SHEET_FILTERS 128
 #define TOOL_VERSION "0.1.0"
+#define JSON_SCHEMA_VERSION 1
 
 static FILE* g_log_fp = NULL;
-#define printf(...) fprintf(g_log_fp ? g_log_fp : stdout, __VA_ARGS__)
+static bool g_quiet = false;
+#define printf(...) do { if (!g_quiet) fprintf(g_log_fp ? g_log_fp : stdout, __VA_ARGS__); } while (0)
 
 typedef struct {
     char code[MAX_WARNING_CODE];
@@ -2184,7 +2186,10 @@ static void write_manifest_json(FILE* fp, const char* input_file,
         }
     }
 
-    fputs("{\"tool_version\":", fp);
+    fputs("{\"schema\":", fp);
+    json_write_string(fp, "manifest");
+    fprintf(fp, ",\"schema_version\":%d", JSON_SCHEMA_VERSION);
+    fputs(",\"tool_version\":", fp);
     json_write_string(fp, TOOL_VERSION);
     fputs(",\"input_file\":", fp);
     json_write_string(fp, input_file);
@@ -2242,7 +2247,10 @@ static void write_manifest_json(FILE* fp, const char* input_file,
 }
 
 static void write_list_sheets_json(FILE* fp, const Workbook* workbook) {
-    fputs("{\"tool_version\":", fp);
+    fputs("{\"schema\":", fp);
+    json_write_string(fp, "list-sheets");
+    fprintf(fp, ",\"schema_version\":%d", JSON_SCHEMA_VERSION);
+    fputs(",\"tool_version\":", fp);
     json_write_string(fp, TOOL_VERSION);
     fputs(",\"sheets\":[", fp);
     for (int i = 0; i < workbook->sheet_count; i++) {
@@ -2637,6 +2645,7 @@ int main(int argc, char* argv[]) {
     bool fail_if_no_sheet = false;
     bool fail_on_output_collision = false;
     bool fail_if_truncated = false;
+    bool quiet = false;
     int max_sheets = 0;
     int max_rows_per_sheet = 0;
     size_t max_output_bytes = 0;
@@ -2673,7 +2682,7 @@ int main(int argc, char* argv[]) {
     }
 
     if (argc < 2 || argv[1][0] == '-') {
-        fprintf(stdout, "Usage: %s <input.xlsx> [start_row] [--mode generic|game-db-fast] [--output-dir dir] [--sheet name] [--sheet-regex pattern] [--list-sheets] [--json] [--manifest-json path] [--manifest-stdout] [--stdout] [--max-sheets n] [--max-rows-per-sheet n] [--max-output-bytes n] [--fail-if-truncated] [--fail-if-no-sheet] [--fail-on-output-collision] [--no-wildcard] [--formatted] [--expand-merged] [--skip-hidden] [--csv] [--jsonl]\n", argv[0]);
+        fprintf(stdout, "Usage: %s <input.xlsx> [start_row] [--mode generic|game-db-fast] [--output-dir dir] [--sheet name] [--sheet-regex pattern] [--list-sheets] [--json] [--manifest-json path] [--manifest-stdout] [--stdout] [--quiet] [--max-sheets n] [--max-rows-per-sheet n] [--max-output-bytes n] [--fail-if-truncated] [--fail-if-no-sheet] [--fail-on-output-collision] [--no-wildcard] [--formatted] [--expand-merged] [--skip-hidden] [--csv] [--jsonl]\n", argv[0]);
         fprintf(stdout, "  --version: Print a stable version string and exit\n");
         fprintf(stdout, "  --sheet name: Select one sheet by exact name (repeatable)\n");
         fprintf(stdout, "  --sheet-regex pattern: Select sheets by POSIX regex\n");
@@ -2681,6 +2690,7 @@ int main(int argc, char* argv[]) {
         fprintf(stdout, "  --json: Emit JSON for --list-sheets\n");
         fprintf(stdout, "  --manifest-json path / --manifest-stdout: Write conversion manifest JSON\n");
         fprintf(stdout, "  --stdout: Write a single selected sheet to stdout\n");
+        fprintf(stdout, "  --quiet: Suppress progress logs; errors and data output still appear\n");
         fprintf(stdout, "  --max-sheets / --max-rows-per-sheet / --max-output-bytes: Resource guards\n");
         fprintf(stdout, "  --fail-if-truncated / --fail-if-no-sheet / --fail-on-output-collision: Strict modes\n");
         free_shared_strings(&shared_strings);
@@ -2773,6 +2783,11 @@ int main(int argc, char* argv[]) {
 
         if (strcmp(argv[i], "--stdout") == 0) {
             stdout_output = true;
+            continue;
+        }
+
+        if (strcmp(argv[i], "--quiet") == 0) {
+            quiet = true;
             continue;
         }
 
@@ -2974,6 +2989,7 @@ int main(int argc, char* argv[]) {
     } else {
         g_log_fp = stdout;
     }
+    g_quiet = quiet;
 
     clock_t start_time = clock();
     styles.enabled = formatted_output;

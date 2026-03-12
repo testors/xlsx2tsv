@@ -3,7 +3,11 @@ xlsx 파일을 TSV/CSV/JSONL로 고속 변환합니다.
 
 ## Usage
 ```bash
-./xlsx_to_tsv <input.xlsx> [start_row] [--mode generic|game-db-fast] [--output-dir dir] [--sheet name] [--sheet-regex pattern] [--list-sheets] [--json] [--manifest-json path] [--manifest-stdout] [--stdout] [--max-sheets n] [--max-rows-per-sheet n] [--max-output-bytes n] [--fail-if-truncated] [--fail-if-no-sheet] [--fail-on-output-collision] [--no-wildcard] [--formatted] [--expand-merged] [--skip-hidden] [--csv] [--jsonl]
+./xlsx_to_tsv <input.xlsx> [start_row] [--mode generic|game-db-fast] [--output-dir dir] [--sheet name] [--sheet-regex pattern] [--list-sheets] [--json] [--manifest-json path] [--manifest-stdout] [--stdout] [--quiet] [--max-sheets n] [--max-rows-per-sheet n] [--max-output-bytes n] [--fail-if-truncated] [--fail-if-no-sheet] [--fail-on-output-collision] [--no-wildcard] [--formatted] [--expand-merged] [--skip-hidden] [--csv] [--jsonl]
+```
+
+```bash
+./xlsx_to_tsv --version
 ```
 
 ## Install
@@ -49,6 +53,7 @@ xlsx 파일을 TSV/CSV/JSONL로 고속 변환합니다.
 - `--manifest-json path`: 변환 결과 manifest JSON을 파일로 저장
 - `--manifest-stdout`: 변환 결과 manifest JSON을 stdout으로 출력
 - `--stdout`: 선택된 단일 시트의 데이터만 stdout으로 출력
+- `--quiet`: 진행 로그를 숨기고 데이터 출력과 에러만 남김
 - `--all-sheets`: generic 모드의 legacy alias
 - `--max-sheets n`: 선택된 시트 수를 앞에서부터 `n`개로 제한
 - `--max-rows-per-sheet n`: 시트별 출력 행 수 제한
@@ -64,6 +69,7 @@ xlsx 파일을 TSV/CSV/JSONL로 고속 변환합니다.
 - `--jsonl`: generic 전용, `.jsonl` 출력
   - 첫 번째 출력 행을 key로 사용하고 이후 행을 object로 출력
 - `--version`: 안정적인 버전 문자열 출력 후 종료
+  - 입력 파일 없이 단독 실행할 수 있습니다.
 
 ## Generic Features
 
@@ -93,14 +99,19 @@ xlsx 파일을 TSV/CSV/JSONL로 고속 변환합니다.
 ### `--version`
 - health check와 wrapper 호환성 판별용 버전 문자열을 출력합니다.
 - 출력 형식: `xlsx2tsv 0.1.0`
+- 입력 파일 없이 `./xlsx_to_tsv --version` 형태로 바로 실행합니다.
 
 ### `--list-sheets --json`
 - 변환 전에 workbook 구조를 빠르게 확인합니다.
+- JSON 루트에는 `schema: "list-sheets"`와 `schema_version: 1`이 포함됩니다.
 - 각 시트의 `sheet_name`, `state`, `hidden`, `selected`, `approx_rows`, `approx_cols`를 JSON으로 출력합니다.
 - `--sheet` / `--sheet-regex`와 함께 쓰면 어떤 시트가 선택되는지 미리 볼 수 있습니다.
+- 조회 전용 모드입니다.
+- `--output-dir`, `--manifest-*`, `--stdout`, `--formatted`, `--expand-merged`, `--skip-hidden`, `--csv`, `--jsonl`, 리소스 가드와 함께 쓸 수 없습니다.
 
 ### `--manifest-json` / `--manifest-stdout`
 - 변환 후 실행 결과를 JSON으로 기록합니다.
+- JSON 루트에는 `schema: "manifest"`와 `schema_version: 1`이 포함됩니다.
 - 포함 정보:
   - 원본 파일
   - mode / output format / start row
@@ -109,6 +120,8 @@ xlsx 파일을 TSV/CSV/JSONL로 고속 변환합니다.
   - 시트별 emitted row/col 수
   - 시트별 warnings / truncated 여부
 - `--manifest-stdout`를 쓰면 manifest는 stdout으로, 진행 로그는 stderr로 출력합니다.
+- `--quiet`를 함께 쓰면 stderr 진행 로그도 숨길 수 있습니다.
+- `--manifest-stdout`는 `--manifest-json`, `--stdout`과 함께 쓸 수 없습니다.
 
 ### `--sheet` / `--sheet-regex`
 - 기본값은 모든 sheet를 처리합니다.
@@ -120,12 +133,22 @@ xlsx 파일을 TSV/CSV/JSONL로 고속 변환합니다.
 - `--max-sheets n`: 선택된 시트를 앞에서부터 `n`개까지만 처리합니다.
 - `--max-rows-per-sheet n`: 각 시트의 출력 행 수를 `n`개로 제한합니다.
 - `--max-output-bytes n`: 전체 출력 바이트 수 상한을 둡니다.
+- `--max-output-bytes`에 걸리면 현재 시트는 중간에서 잘릴 수 있고, 이후 선택된 시트는 건너뛸 수 있습니다.
+- 잘림과 스킵 정보는 manifest warning에 기록됩니다.
 - `--fail-if-truncated`: 위 제한에 걸려 일부만 출력됐을 때 exit code를 `1`로 만듭니다.
 
 ### `--stdout`
 - 선택된 단일 시트만 stdout으로 출력합니다.
 - `--sheet` 또는 `--sheet-regex`로 결과가 정확히 1개 sheet가 되도록 지정해야 합니다.
 - `--output-dir`와 함께 쓸 수 없습니다.
+- `--fail-on-output-collision`과도 함께 쓸 수 없습니다.
+- `--manifest-stdout`와도 함께 쓸 수 없습니다.
+- `--quiet`를 함께 쓰면 stderr 진행 로그 없이 순수 데이터만 받을 수 있습니다.
+
+### `--quiet`
+- 진행 상황과 요약 로그를 숨깁니다.
+- stdout 데이터 출력과 stderr 에러 메시지는 그대로 유지합니다.
+- `--manifest-stdout`, `--stdout`, `--list-sheets --json`와 같이 머신이 stdout을 읽는 경우 특히 유용합니다.
 
 ## Wildcard Behavior
 
@@ -189,9 +212,10 @@ mkdir -p out && ./xlsx_to_tsv report.xlsx 2 --formatted --csv --output-dir out
 
 ### select one sheet and stream to stdout
 ```bash
-./xlsx_to_tsv report.xlsx 2 --sheet Summary --stdout
+./xlsx_to_tsv report.xlsx 2 --sheet Summary --stdout --quiet
 ```
 - `Summary` 시트만 stdout으로 출력합니다.
+- stderr 진행 로그 없이 데이터만 받습니다.
 
 ### export with manifest
 ```bash

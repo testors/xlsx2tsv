@@ -41,6 +41,7 @@ xlsx 파일을 TSV/CSV/JSONL로 고속 변환합니다.
   - `game-db-fast` 모드: `start_row` 행을 헤더 행으로 사용
 - `--mode generic|game-db-fast`: export 모드 선택, 기본값은 `generic`
 - `--output-dir dir`: 기존 디렉터리 아래에 출력 파일 생성
+  - 디렉터리는 미리 존재해야 합니다.
 - `--all-sheets`: generic 모드의 legacy alias
 - `--no-wildcard`: `game-db-fast` 전용 옵션
 - `--formatted`: generic 전용, `styles.xml` 숫자 포맷 적용
@@ -116,7 +117,7 @@ generic 모드에서는 위 제한을 적용하지 않습니다.
 
 ### generic + CSV
 ```bash
-./xlsx_to_tsv report.xlsx 2 --formatted --csv --output-dir out
+mkdir -p out && ./xlsx_to_tsv report.xlsx 2 --formatted --csv --output-dir out
 ```
 - 각 시트를 `.csv`로 출력합니다.
 - 결과 파일은 `out/` 아래에 생성됩니다.
@@ -129,7 +130,7 @@ generic 모드에서는 위 제한을 적용하지 않습니다.
 
 ### game DB fast export
 ```bash
-./xlsx_to_tsv data.xlsx 4 --mode game-db-fast --output-dir out
+mkdir -p out && ./xlsx_to_tsv data.xlsx 4 --mode game-db-fast --output-dir out
 ```
 - 4행을 헤더 행으로 사용합니다.
 - 게임 DB 규칙에 맞지 않는 시트/컬럼은 제외합니다.

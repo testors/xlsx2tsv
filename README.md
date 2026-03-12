@@ -6,6 +6,18 @@ xlsx 파일을 TSV/CSV/JSONL로 고속 변환합니다.
 ./xlsx_to_tsv <input.xlsx> [start_row] [--mode generic|game-db-fast] [--output-dir dir] [--no-wildcard] [--formatted] [--expand-merged] [--skip-hidden] [--csv] [--jsonl]
 ```
 
+## Install
+```bash
+./install.sh
+```
+
+- 기본 설치 위치는 `$HOME/.local/bin/xlsx_to_tsv`
+- `--prefix /path` 또는 `--bin-dir /path/to/bin`으로 변경 가능
+- 예시:
+```bash
+./install.sh --bin-dir "$HOME/bin"
+```
+
 ## Modes
 
 ### 기본값: generic

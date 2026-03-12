@@ -12,7 +12,6 @@
 #define MAX_CELL_VALUE 32768
 #define BUFFER_SIZE 65536
 #define MAX_SHEET_NAME 256
-#define MAX_SHEETS 50
 #define MAX_REL_ID 64
 #define MAX_OUTPUT_FILENAME (MAX_SHEET_NAME + 32)
 
@@ -34,8 +33,9 @@ typedef struct {
 
 // 워크북 구조체
 typedef struct {
-    SheetInfo sheets[MAX_SHEETS];
+    SheetInfo* sheets;
     int sheet_count;
+    int sheet_capacity;
 } Workbook;
 
 typedef enum {
@@ -115,6 +115,31 @@ typedef struct {
 
 void unescape_xml_entities(char* str);
 void escape_tsv_value(const char* input, char* output, int max_len);
+
+static void init_workbook(Workbook* wb) {
+    wb->sheets = NULL;
+    wb->sheet_count = 0;
+    wb->sheet_capacity = 0;
+}
+
+static void free_workbook(Workbook* wb) {
+    free(wb->sheets);
+    init_workbook(wb);
+}
+
+static void ensure_workbook_capacity(Workbook* wb, int needed) {
+    if (needed <= wb->sheet_capacity) {
+        return;
+    }
+
+    int new_capacity = wb->sheet_capacity ? wb->sheet_capacity * 2 : 16;
+    while (new_capacity < needed) {
+        new_capacity *= 2;
+    }
+
+    wb->sheets = realloc(wb->sheets, sizeof(SheetInfo) * new_capacity);
+    wb->sheet_capacity = new_capacity;
+}
 
 // 빠른 XML 속성 찾기 - 제공된 버퍼에 쓰기
 // 추출된 값의 길이를 반환, 찾지 못하면 -1 반환
@@ -1297,7 +1322,7 @@ void parse_workbook(const char* xml_data, Workbook* wb, bool export_all_sheets) 
     char sheet_id_attr[32];
     char rel_id_attr[MAX_REL_ID];
 
-    while ((pos = strstr(pos, "<sheet ")) != NULL && wb->sheet_count < MAX_SHEETS) {
+    while ((pos = strstr(pos, "<sheet ")) != NULL) {
         // 시트 이름 추출
         if (FIND_ATTR_NAME(pos, name_attr, MAX_SHEET_NAME) < 0) {
             pos++;
@@ -1323,6 +1348,7 @@ void parse_workbook(const char* xml_data, Workbook* wb, bool export_all_sheets) 
         }
 
         // 시트 정보 저장
+        ensure_workbook_capacity(wb, wb->sheet_count + 1);
         strncpy(wb->sheets[wb->sheet_count].name, name_attr, MAX_SHEET_NAME - 1);
         wb->sheets[wb->sheet_count].name[MAX_SHEET_NAME - 1] = '\0';
         strncpy(wb->sheets[wb->sheet_count].rel_id, rel_id_attr, MAX_REL_ID - 1);
@@ -1508,7 +1534,112 @@ static bool row_buffer_has_visible_cells(const RowBuffer* row_buffer, const Hidd
     return false;
 }
 
-static void emit_row_buffer(RowBuffer* row_buffer, const HiddenColumns* hidden_columns, Filter* output) {
+static int find_last_visible_col_in_range(int start_col, int end_col, const HiddenColumns* hidden_columns) {
+    for (int col = end_col; col >= start_col; col--) {
+        if (!is_hidden_column(hidden_columns, col)) {
+            return col;
+        }
+    }
+    return -1;
+}
+
+static int scan_generic_visible_max_col(const char* xml_data, int start_row, bool skip_hidden,
+                                        const HiddenColumns* hidden_columns, const MergeRegions* merge_regions) {
+    const char* xml_end = xml_data + strlen(xml_data);
+    const char* pos = xml_data;
+    int max_visible_col = -1;
+
+    while ((pos = find_next_start_tag_local(pos, xml_end, "row")) != NULL) {
+        const char* row_tag_end = find_tag_end_in_range(pos, xml_end);
+        const char* row_close;
+        const char* row_close_end;
+        char row_open_tag[256];
+        char row_attr[32];
+        char hidden_attr[16];
+        int row = -1;
+        bool row_hidden = false;
+
+        if (!row_tag_end) {
+            break;
+        }
+
+        copy_tag_range(pos, row_tag_end, row_open_tag, sizeof(row_open_tag));
+        row_close = is_self_closing_tag(pos, row_tag_end) ? NULL : find_next_end_tag_local(row_tag_end + 1, xml_end, "row");
+        row_close_end = row_close ? find_tag_end_in_range(row_close, xml_end) : row_tag_end;
+        if (!row_close_end) {
+            break;
+        }
+
+        if (find_attribute(row_open_tag, "r=", 2, row_attr, sizeof(row_attr)) >= 0) {
+            row = atoi(row_attr) - 1;
+        }
+
+        if (row < start_row) {
+            pos = row_close_end + 1;
+            continue;
+        }
+
+        if (skip_hidden &&
+            FIND_ATTR_HIDDEN(row_open_tag, hidden_attr, sizeof(hidden_attr)) >= 0 &&
+            attr_is_true(hidden_attr)) {
+            row_hidden = true;
+        }
+
+        if (!row_hidden && row_close) {
+            const char* cell_pos = row_tag_end + 1;
+            while ((cell_pos = find_next_start_tag_local(cell_pos, row_close, "c")) != NULL) {
+                const char* cell_tag_end = find_tag_end_in_range(cell_pos, row_close);
+                char cell_open_tag[512];
+                char r_attr[32];
+                int col;
+
+                if (!cell_tag_end) {
+                    break;
+                }
+
+                copy_tag_range(cell_pos, cell_tag_end, cell_open_tag, sizeof(cell_open_tag));
+                if (FIND_ATTR_R(cell_open_tag, r_attr, sizeof(r_attr)) >= 0) {
+                    col = col_ref_to_num(r_attr);
+                    if (!is_hidden_column(hidden_columns, col) && col > max_visible_col) {
+                        max_visible_col = col;
+                    }
+                }
+
+                if (is_self_closing_tag(cell_pos, cell_tag_end)) {
+                    cell_pos = cell_tag_end + 1;
+                } else {
+                    const char* cell_close = find_next_end_tag_local(cell_tag_end + 1, row_close, "c");
+                    const char* cell_close_end = cell_close ? find_tag_end_in_range(cell_close, row_close) : NULL;
+                    if (!cell_close_end) {
+                        break;
+                    }
+                    cell_pos = cell_close_end + 1;
+                }
+            }
+        }
+
+        pos = row_close_end + 1;
+    }
+
+    for (int i = 0; i < merge_regions->count; i++) {
+        const MergeRegion* region = &merge_regions->regions[i];
+        int visible_col;
+
+        if (region->end_row < start_row) {
+            continue;
+        }
+
+        visible_col = find_last_visible_col_in_range(region->start_col, region->end_col, hidden_columns);
+        if (visible_col > max_visible_col) {
+            max_visible_col = visible_col;
+        }
+    }
+
+    return max_visible_col;
+}
+
+static void emit_row_buffer(RowBuffer* row_buffer, const HiddenColumns* hidden_columns,
+                            int target_max_col, bool allow_empty_row, Filter* output) {
     sort_row_buffer(row_buffer);
 
     int last_col = -1;
@@ -1528,7 +1659,14 @@ static void emit_row_buffer(RowBuffer* row_buffer, const HiddenColumns* hidden_c
         last_col = col;
     }
 
-    if (last_col >= 0) {
+    for (int gap_col = last_col + 1; gap_col <= target_max_col; gap_col++) {
+        if (!is_hidden_column(hidden_columns, gap_col)) {
+            filter_push(output, "");
+            last_col = gap_col;
+        }
+    }
+
+    if (last_col >= 0 || allow_empty_row) {
         filter_finish_line(output);
     }
 }
@@ -1546,13 +1684,14 @@ static int max_merge_row_with_values(const MergeRegions* merge_regions) {
 static void emit_synthetic_merge_rows(int first_row, int last_row,
                                       const HiddenColumns* hidden_columns,
                                       MergeRegions* merge_regions,
+                                      int target_max_col,
                                       RowBuffer* row_buffer,
                                       Filter* output) {
     for (int row = first_row; row < last_row; row++) {
         clear_row_buffer(row_buffer);
         apply_merge_regions_to_row(merge_regions, row, row_buffer);
-        if (row_buffer_has_visible_cells(row_buffer, hidden_columns)) {
-            emit_row_buffer(row_buffer, hidden_columns, output);
+        if (row_buffer_has_visible_cells(row_buffer, hidden_columns) || target_max_col >= 0) {
+            emit_row_buffer(row_buffer, hidden_columns, target_max_col, target_max_col < 0, output);
         }
     }
 }
@@ -1882,6 +2021,8 @@ void parse_worksheet_generic(const char* xml_data, SharedStrings* ss, const Styl
     const char* pos = xml_data;
     int last_parsed_row = -1;
     int inferred_row = -1;
+    int target_max_col = scan_generic_visible_max_col(xml_data, start_row, skip_hidden,
+                                                      hidden_columns, merge_regions);
     RowBuffer row_buffer;
 
     init_row_buffer(&row_buffer);
@@ -1929,7 +2070,7 @@ void parse_worksheet_generic(const char* xml_data, SharedStrings* ss, const Styl
             }
             if (synthetic_start < row) {
                 emit_synthetic_merge_rows(synthetic_start, row, hidden_columns, merge_regions,
-                                          &row_buffer, output);
+                                          target_max_col, &row_buffer, output);
             }
         }
 
@@ -1993,8 +2134,8 @@ void parse_worksheet_generic(const char* xml_data, SharedStrings* ss, const Styl
 
         apply_merge_regions_to_row(merge_regions, row, &row_buffer);
 
-        if (row >= start_row && !row_hidden && row_buffer_has_visible_cells(&row_buffer, hidden_columns)) {
-            emit_row_buffer(&row_buffer, hidden_columns, output);
+        if (row >= start_row && !row_hidden) {
+            emit_row_buffer(&row_buffer, hidden_columns, target_max_col, target_max_col < 0, output);
         }
 
         last_parsed_row = row;
@@ -2009,7 +2150,7 @@ void parse_worksheet_generic(const char* xml_data, SharedStrings* ss, const Styl
         }
         if (trailing_start < trailing_end) {
             emit_synthetic_merge_rows(trailing_start, trailing_end, hidden_columns, merge_regions,
-                                      &row_buffer, output);
+                                      target_max_col, &row_buffer, output);
         }
     }
 
@@ -2028,79 +2169,101 @@ void free_shared_strings(SharedStrings* ss) {
 
 int main(int argc, char* argv[]) {
     if (argc < 2) {
-        printf("Usage: %s <input.xlsx> [start_row] [--no-wildcard] [--all-sheets] [--formatted] [--expand-merged] [--skip-hidden] [--csv] [--jsonl]\n", argv[0]);
+        printf("Usage: %s <input.xlsx> [start_row] [--mode generic|game-db-fast] [--no-wildcard] [--formatted] [--expand-merged] [--skip-hidden] [--csv] [--jsonl]\n", argv[0]);
         printf("  start_row: 1-based row number to start conversion (default: 1)\n");
         printf("             Rows before start_row are ignored\n");
-        printf("             Default mode uses the start_row row as the TSV header row\n");
-        printf("  --all-sheets: Export every worksheet and keep all columns without header filtering\n");
-        printf("  --formatted: Use styles.xml number formats for human-readable values in all-sheets mode\n");
-        printf("  --expand-merged: Fill merged cells with the top-left value in all-sheets mode\n");
-        printf("  --skip-hidden: Skip hidden rows and hidden columns in all-sheets mode\n");
-        printf("  --csv: Write generic output as CSV files instead of TSV\n");
-        printf("  --jsonl: Write generic output as JSONL files using the first emitted row as field names\n");
+        printf("             Default generic mode exports rows from start_row as-is\n");
+        printf("             --mode game-db-fast uses the start_row row as the TSV header row\n");
+        printf("  --mode generic|game-db-fast: Select export mode (default: generic)\n");
+        printf("  --all-sheets: Legacy alias for generic mode\n");
+        printf("  --no-wildcard: Game DB fast mode only; skip sheets/columns containing *\n");
+        printf("  --formatted: Generic mode only; use styles.xml number formats for human-readable values\n");
+        printf("  --expand-merged: Generic mode only; fill merged cells with the top-left value\n");
+        printf("  --skip-hidden: Generic mode only; skip hidden rows and hidden columns\n");
+        printf("  --csv: Generic mode only; write CSV files instead of TSV\n");
+        printf("  --jsonl: Generic mode only; write JSONL using the first emitted row as field names\n");
         printf("\n");
         printf("Wildcard (*) character behavior:\n");
-        printf("  Default mode:\n");
+        printf("  Generic mode:\n");
+        printf("    - * characters are preserved in sheet/header text\n");
+        printf("    - Output filenames still sanitize unsafe filesystem characters\n");
+        printf("  Game DB fast mode:\n");
         printf("    - * characters are removed from sheet/column names in output\n");
         printf("    - Example: '*Sales' -> 'Sales.tsv', '*ID' column -> 'ID'\n");
         printf("  --no-wildcard mode:\n");
         printf("    - Sheets containing * will be skipped entirely\n");
         printf("    - Columns containing * will be excluded from output\n");
         printf("\n");
-        printf("Note: Default mode only exports sheets/headers matching the game DB naming rules\n");
-        printf("      --all-sheets disables sheet/header name filtering and only sanitizes output filenames\n");
-        printf("      --formatted implies --all-sheets and formats dates/times/numbers for LLM-friendly TSV output\n");
-        printf("      --expand-merged, --skip-hidden, --csv, and --jsonl also imply --all-sheets\n");
+        printf("Note: Generic mode is now the default and exports every worksheet\n");
+        printf("      --mode game-db-fast enables the original sheet/header filtering fast path\n");
+        printf("      --formatted, --expand-merged, --skip-hidden, --csv, and --jsonl require generic mode\n");
         return 1;
     }
     
     const char* input_file = argv[1];
     int start_row = 0;
-    bool export_all_sheets = false;
+    bool export_all_sheets = true;
+    bool game_db_fast_mode = false;
     bool formatted_output = false;
     bool expand_merged_cells = false;
     bool skip_hidden = false;
+    bool all_sheets_alias = false;
+    bool no_wildcard_mode = false;
     bool start_row_set = false;
     OutputFormat output_format = OUTPUT_FORMAT_TSV;
 
     for (int i = 2; i < argc; i++) {
+        if (strcmp(argv[i], "--mode") == 0) {
+            if (i + 1 >= argc) {
+                printf("Error: --mode requires a value: generic or game-db-fast\n");
+                return 1;
+            }
+
+            i++;
+            if (strcmp(argv[i], "generic") == 0) {
+                game_db_fast_mode = false;
+            } else if (strcmp(argv[i], "game-db-fast") == 0) {
+                game_db_fast_mode = true;
+            } else {
+                printf("Error: Unknown mode: %s (expected generic or game-db-fast)\n", argv[i]);
+                return 1;
+            }
+            continue;
+        }
+
         if (strcmp(argv[i], "--no-wildcard") == 0) {
             ALLOW_WILD_CARD = false;
+            no_wildcard_mode = true;
             continue;
         }
 
         if (strcmp(argv[i], "--all-sheets") == 0) {
-            export_all_sheets = true;
+            all_sheets_alias = true;
             continue;
         }
 
         if (strcmp(argv[i], "--formatted") == 0) {
             formatted_output = true;
-            export_all_sheets = true;
             continue;
         }
 
         if (strcmp(argv[i], "--expand-merged") == 0) {
             expand_merged_cells = true;
-            export_all_sheets = true;
             continue;
         }
 
         if (strcmp(argv[i], "--skip-hidden") == 0) {
             skip_hidden = true;
-            export_all_sheets = true;
             continue;
         }
 
         if (strcmp(argv[i], "--csv") == 0) {
             output_format = OUTPUT_FORMAT_CSV;
-            export_all_sheets = true;
             continue;
         }
 
         if (strcmp(argv[i], "--jsonl") == 0) {
             output_format = OUTPUT_FORMAT_JSONL;
-            export_all_sheets = true;
             continue;
         }
 
@@ -2118,11 +2281,25 @@ int main(int argc, char* argv[]) {
 
     if (start_row < 0) start_row = 0;
 
+    export_all_sheets = !game_db_fast_mode;
+
+    if (game_db_fast_mode &&
+        (formatted_output || expand_merged_cells || skip_hidden ||
+         output_format != OUTPUT_FORMAT_TSV || all_sheets_alias)) {
+        printf("Error: --mode game-db-fast cannot be combined with generic-mode options\n");
+        return 1;
+    }
+
+    if (!game_db_fast_mode && no_wildcard_mode) {
+        printf("Error: --no-wildcard requires --mode game-db-fast\n");
+        return 1;
+    }
+
     printf("Converting XLSX to multiple TSV files...\n");
     printf("Input: %s\n", input_file);
     printf("Starting from row: %d\n", start_row + 1);
     if (export_all_sheets) {
-        printf("Mode: all sheets\n");
+        printf("Mode: generic\n");
         if (formatted_output) {
             printf("Formatting: enabled\n");
         }
@@ -2136,6 +2313,11 @@ int main(int argc, char* argv[]) {
             printf("Output format: csv\n");
         } else if (output_format == OUTPUT_FORMAT_JSONL) {
             printf("Output format: jsonl\n");
+        }
+    } else {
+        printf("Mode: game-db-fast\n");
+        if (no_wildcard_mode) {
+            printf("Wildcard policy: strict skip\n");
         }
     }
 
@@ -2155,11 +2337,13 @@ int main(int argc, char* argv[]) {
 
     // 워크북 초기화 및 시트 정보 파싱
     Workbook workbook;
+    init_workbook(&workbook);
     int workbook_index;
     if (!mz_zip_reader_locate_file(&zip, "xl/workbook.xml", &workbook_index)) {
         printf("Error: Could not find workbook.xml in XLSX file\n");
         mz_zip_reader_end(&zip);
         free_styles(&styles);
+        free_workbook(&workbook);
         return 1;
     }
 
@@ -2171,6 +2355,7 @@ int main(int argc, char* argv[]) {
         free(workbook_data);
         mz_zip_reader_end(&zip);
         free_styles(&styles);
+        free_workbook(&workbook);
         return 1;
     }
     
@@ -2184,6 +2369,7 @@ int main(int argc, char* argv[]) {
         printf("Error: Could not find workbook.xml.rels in XLSX file\n");
         mz_zip_reader_end(&zip);
         free_styles(&styles);
+        free_workbook(&workbook);
         return 1;
     }
 
@@ -2195,6 +2381,7 @@ int main(int argc, char* argv[]) {
         free(workbook_rels_data);
         mz_zip_reader_end(&zip);
         free_styles(&styles);
+        free_workbook(&workbook);
         return 1;
     }
 
@@ -2210,6 +2397,7 @@ int main(int argc, char* argv[]) {
         }
         mz_zip_reader_end(&zip);
         free_styles(&styles);
+        free_workbook(&workbook);
         return 1;
     }
 
@@ -2256,7 +2444,7 @@ int main(int argc, char* argv[]) {
 
     // 각 시트 처리
     int processed_sheets = 0;
-    char used_output_names[MAX_SHEETS][MAX_OUTPUT_FILENAME];
+    char (*used_output_names)[MAX_OUTPUT_FILENAME] = calloc((size_t)workbook.sheet_count, sizeof(*used_output_names));
     int used_output_count = 0;
     const char* output_extension = "tsv";
     if (output_format == OUTPUT_FORMAT_CSV) {
@@ -2351,6 +2539,7 @@ int main(int argc, char* argv[]) {
     mz_zip_reader_end(&zip);
     free_shared_strings(&shared_strings);
     free_styles(&styles);
+    free(used_output_names);
     
     clock_t end_time = clock();
     double elapsed = ((double)(end_time - start_time)) / CLOCKS_PER_SEC;
@@ -2367,9 +2556,11 @@ int main(int argc, char* argv[]) {
                 printf("  - %s (from sheet: %s)\n", workbook.sheets[i].output_name, workbook.sheets[i].name);
             }
         }
+        free_workbook(&workbook);
         return 0;
     } else {
         printf("No sheets were processed successfully.\n");
+        free_workbook(&workbook);
         return 1;
     }
 }

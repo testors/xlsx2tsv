@@ -17,7 +17,7 @@ clean:
 
 test: $(TARGET)
 	@echo "Build completed successfully!"
-	@echo "Usage: ./$(TARGET) input.xlsx [start_row] [--no-wildcard] [--all-sheets] [--formatted] [--expand-merged] [--skip-hidden] [--csv] [--jsonl]"
+	@echo "Usage: ./$(TARGET) input.xlsx [start_row] [--mode generic|game-db-fast] [--no-wildcard] [--formatted] [--expand-merged] [--skip-hidden] [--csv] [--jsonl]"
 
 install: $(TARGET)
 	cp $(TARGET) /usr/local/bin/

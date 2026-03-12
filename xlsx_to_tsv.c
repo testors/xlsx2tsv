@@ -5,6 +5,7 @@
 #include <time.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <sys/stat.h>
 
 #include "miniz.h"
 #include "filter.h"
@@ -14,6 +15,7 @@
 #define MAX_SHEET_NAME 256
 #define MAX_REL_ID 64
 #define MAX_OUTPUT_FILENAME (MAX_SHEET_NAME + 32)
+#define MAX_OUTPUT_PATH 4096
 
 // 성능을 위한 공유 문자열 구조체
 typedef struct {
@@ -27,7 +29,7 @@ typedef struct {
     char name[MAX_SHEET_NAME];
     char rel_id[MAX_REL_ID];
     char filename[MAX_SHEET_NAME];
-    char output_name[MAX_OUTPUT_FILENAME];
+    char output_name[MAX_OUTPUT_PATH];
     int sheet_id;
 } SheetInfo;
 
@@ -1933,6 +1935,24 @@ void create_unique_output_filename(const char* sheet_name, int sheet_index,
     }
 }
 
+static void join_output_path(const char* output_dir, const char* filename,
+                             char* output_path, int max_len) {
+    size_t dir_len;
+
+    if (!output_dir || output_dir[0] == '\0' || strcmp(output_dir, ".") == 0) {
+        strncpy(output_path, filename, (size_t)max_len - 1);
+        output_path[max_len - 1] = '\0';
+        return;
+    }
+
+    dir_len = strlen(output_dir);
+    if (dir_len > 0 && output_dir[dir_len - 1] == '/') {
+        snprintf(output_path, (size_t)max_len, "%s%s", output_dir, filename);
+    } else {
+        snprintf(output_path, (size_t)max_len, "%s/%s", output_dir, filename);
+    }
+}
+
 // 고성능 워크시트 파서
 void parse_worksheet(const char* xml_data, SharedStrings* ss, int start_row, Filter* output) {
     const char* pos = xml_data;
@@ -2279,12 +2299,13 @@ void free_shared_strings(SharedStrings* ss) {
 
 int main(int argc, char* argv[]) {
     if (argc < 2) {
-        printf("Usage: %s <input.xlsx> [start_row] [--mode generic|game-db-fast] [--no-wildcard] [--formatted] [--expand-merged] [--skip-hidden] [--csv] [--jsonl]\n", argv[0]);
+        printf("Usage: %s <input.xlsx> [start_row] [--mode generic|game-db-fast] [--output-dir dir] [--no-wildcard] [--formatted] [--expand-merged] [--skip-hidden] [--csv] [--jsonl]\n", argv[0]);
         printf("  start_row: 1-based row number to start conversion (default: 1)\n");
         printf("             Rows before start_row are ignored\n");
         printf("             Default generic mode exports rows from start_row as-is\n");
         printf("             --mode game-db-fast uses the start_row row as the TSV header row\n");
         printf("  --mode generic|game-db-fast: Select export mode (default: generic)\n");
+        printf("  --output-dir dir: Write output files under an existing directory\n");
         printf("  --all-sheets: Legacy alias for generic mode\n");
         printf("  --no-wildcard: Game DB fast mode only; skip sheets/columns containing *\n");
         printf("  --formatted: Generic mode only; use styles.xml number formats for human-readable values\n");
@@ -2321,6 +2342,7 @@ int main(int argc, char* argv[]) {
     bool no_wildcard_mode = false;
     bool start_row_set = false;
     OutputFormat output_format = OUTPUT_FORMAT_TSV;
+    const char* output_dir = NULL;
 
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "--mode") == 0) {
@@ -2336,6 +2358,22 @@ int main(int argc, char* argv[]) {
                 game_db_fast_mode = true;
             } else {
                 printf("Error: Unknown mode: %s (expected generic or game-db-fast)\n", argv[i]);
+                return 1;
+            }
+            continue;
+        }
+
+        if (strcmp(argv[i], "--output-dir") == 0) {
+            struct stat st;
+
+            if (i + 1 >= argc) {
+                printf("Error: --output-dir requires a directory path\n");
+                return 1;
+            }
+
+            output_dir = argv[++i];
+            if (stat(output_dir, &st) != 0 || !S_ISDIR(st.st_mode)) {
+                printf("Error: Output directory does not exist or is not a directory: %s\n", output_dir);
                 return 1;
             }
             continue;
@@ -2408,6 +2446,9 @@ int main(int argc, char* argv[]) {
     printf("Converting XLSX to multiple TSV files...\n");
     printf("Input: %s\n", input_file);
     printf("Starting from row: %d\n", start_row + 1);
+    if (output_dir && output_dir[0] != '\0') {
+        printf("Output directory: %s\n", output_dir);
+    }
     if (export_all_sheets) {
         printf("Mode: generic\n");
         if (formatted_output) {
@@ -2605,28 +2646,30 @@ int main(int argc, char* argv[]) {
 
         // 안전한 출력 파일명 생성
         char output_filename[MAX_OUTPUT_FILENAME];
+        char output_path[MAX_OUTPUT_PATH];
         create_unique_output_filename(workbook.sheets[i].name, i, used_output_names, used_output_count,
                                       output_extension, output_filename, sizeof(output_filename));
+        join_output_path(output_dir, output_filename, output_path, sizeof(output_path));
 
         // 출력 파일 열기
-        Filter* output = filter_init(output_filename,
+        Filter* output = filter_init(output_path,
                                      export_all_sheets ? FILTER_MODE_RAW : FILTER_MODE_GAME_DB,
                                      output_format);
         if (!output) {
-            printf("Warning: Could not create output file: %s - skipping\n\n", output_filename);
+            printf("Warning: Could not create output file: %s - skipping\n\n", output_path);
             free_hidden_columns(&hidden_columns);
             free_merge_regions(&merge_regions);
             free(worksheet_data);
             continue;
         }
 
-        strncpy(workbook.sheets[i].output_name, output_filename, MAX_OUTPUT_FILENAME - 1);
-        workbook.sheets[i].output_name[MAX_OUTPUT_FILENAME - 1] = '\0';
+        strncpy(workbook.sheets[i].output_name, output_path, MAX_OUTPUT_PATH - 1);
+        workbook.sheets[i].output_name[MAX_OUTPUT_PATH - 1] = '\0';
         strncpy(used_output_names[used_output_count], output_filename, MAX_OUTPUT_FILENAME - 1);
         used_output_names[used_output_count][MAX_OUTPUT_FILENAME - 1] = '\0';
         used_output_count++;
 
-        printf("  Output file: %s\n", output_filename);
+        printf("  Output file: %s\n", output_path);
 
         // 워크시트 파싱 및 TSV 생성
         if (export_all_sheets) {

@@ -26,7 +26,7 @@ XLSX 파일을 TSV/CSV/JSONL로 빠르게 변환합니다.
 ### 1. 모든 시트를 TSV로 변환
 
 ```bash
-./xlsx_to_tsv report.xlsx 1
+./xlsx_to_tsv report.xlsx
 ```
 
 - 기본 모드인 `generic`으로 모든 worksheet를 출력합니다.
